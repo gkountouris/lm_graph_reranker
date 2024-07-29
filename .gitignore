@@ -18,6 +18,25 @@ test6.py
 tf_mini_matrices_creator.py
 weight_similarities.py
 json.train
+biolinkbert_embeddings.py
+check_bm25vsbioasq.py
+compute_querry_embeddings.py
+dragon.py
+dragon_embeddings.py
+drums_rerank.py
+drums_retriever_bm25.py
+drums.py
+entities_embeddings.py
+hit_elastic_with_question.py
+json_train.py
+plot_matplot.py
+pre_process_docs.py
+prepare_doc_embeddings.py
+umls_concept_possitions.py
+TF_idf_right.py
+test_graph_creation.py
+test_preprocess.py
+
 
 *hdf5
 *xml
