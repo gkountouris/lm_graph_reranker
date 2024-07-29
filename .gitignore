@@ -3,6 +3,10 @@
 /logs
 /saved_models
 /runs
+/elastic
+/embeddings
+/tests
+/thesis
 
 *xml
 *json
