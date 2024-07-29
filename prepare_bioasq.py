@@ -1,6 +1,7 @@
 import requests
 import gzip
 import io
+import glob
 import os
 import xml.etree.ElementTree as ET
 from xml.etree.ElementTree import tostring
@@ -18,7 +19,6 @@ import string
 import scispacy
 from scispacy.linking import EntityLinker
 
-
 UMLS_VOCAB = None
 nlp = None
 linker = None
@@ -27,7 +27,6 @@ def load_umls_vocab(vocab_path):
     with open(vocab_path, "r", encoding="utf8") as fin:
         vocab = [l.strip() for l in fin]
     return vocab
-
 
 def load_entity_linker(threshold=0.90):
     nlp = spacy.load("en_core_sci_sm")
@@ -83,11 +82,9 @@ def ground_abstract(line):
     return question_concepts
 
 def number_of_empty(output_path):
-
     # Load your JSON data
     with open(output_path + '/BioASQ_grounded.json', 'r') as file:
         data = json.load(file)
-
     # Iterate over the data and check for empty graph_entities
     empty_graph_entities = []
     with_graph_entities = []
@@ -96,9 +93,21 @@ def number_of_empty(output_path):
             empty_graph_entities.append(idx)
         else:
             with_graph_entities.append(idx)
-
     print("Documents with empty graph_entities:", len(with_graph_entities))
     print("Documents with empty graph_entities:", len(empty_graph_entities))
+
+def rename_file(file_path):
+    
+    # Split the path into directory and file name
+    dir_name, file_name = os.path.split(file_path)
+    
+    # Split the filename into name and extension
+    base_name, _ = os.path.splitext(file_name)
+    
+    # Create the new filename by adding '.statement' before the extension
+    new_file_name = base_name + '.statement.jsonl'
+    
+    return new_file_name
 
 def main(umls_vocab_path, output_path):
     global UMLS_VOCAB
@@ -109,34 +118,48 @@ def main(umls_vocab_path, output_path):
         print("Loading scispacy...")
         nlp, linker = load_entity_linker()
         print("Loaded scispacy.")
+    dict_path = "data/pubmed_processed/hdf5/id_pmid_mapping.json"
+    with open(dict_path, 'r', encoding='utf-8') as f:
+        docs = json.load(f)
+    pid_to_id = {v: k for k, v in docs.items()}
     
-    with open(output_path + "/training12b_new.json", "r") as f:
-
-        data = json.load(f)
-
-        counter = 0 
-        questions = []
-        for i in data['questions']:
-            questions.append(i['body'])
-            if counter > 15:
-                break
-        f.close()
-
-    articles_data = []
-    
-    for q in questions:
-
-        linked_entities = ground_abstract(q)
-        articles_data.append({
-                        'question': q,
-                        'graph_entities': linked_entities
-                    })
-    # Store the concatenated information in a JSON file
-    with open(output_path + "/BioASQ_grounded.json", "w") as f:
-        json.dump(articles_data, f, indent=4)
+    # Create a pattern to match all .json files
+    pattern = os.path.join(output_path + "/raw", '*.json')
+    # Use glob.glob() to find all files that match the pattern
+    json_files = glob.glob(pattern)
+    for file in json_files:
+        articles_data = []
+        with open(file, "r") as f:
+            data = json.load(f)
+            for i, dato in enumerate(data['questions']):
+                t_id = f"train-{i:06d}"
+                question = dato['body']
+                ids = []
+                for url in dato['documents']:
+                    try:
+                        ids.append(pid_to_id[url.split('/')[-1]])
+                    except:
+                        pass
+                answers = ids
+                if not answers:
+                    continue
+                try:
+                    linked_entities = ground_abstract(question)
+                except:
+                    linked_entities = []
+                articles_data.append({
+                                'sent': question,
+                                'qc': linked_entities,
+                                'ans': answers,
+                                'id': t_id
+                            })
+            f.close()
+        # Write each item in articles_data to the .jsonl file, one object per line
+        with open(output_path + "/statement/" + rename_file(file), "w") as f:
+            for article in articles_data:
+                f.write(json.dumps(article) + '\n')  # Write each JSON object as a string followed by a newline
 
 if __name__ == "__main__":
     vocab = './data/umls/concepts.txt'
     output_path = './data/BioASQ'
-    # main(vocab, output_path)
-    number_of_empty(output_path)
+    main(vocab, output_path)

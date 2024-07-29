@@ -5,13 +5,11 @@ export TOKENIZERS_PARALLELISM=true
 export OMP_NUM_THREADS=4
 dt=`date '+%Y%m%d_%H%M%S'`
 
-
 dataset="csqa"
 shift
 encoder='roberta-large'
 load_model_path=None
 args=$@
-
 
 elr="1e-5"
 dlr="1e-3"

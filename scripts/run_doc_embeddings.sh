@@ -29,14 +29,13 @@ k=5 #num of gnn layers
 residual_ie=2
 gnndim=200
 
-
 encoder_layer=-1
 max_node_num=400
 seed=5
 lr_schedule=warmup_linear
 warmup_steps=500
 
-n_epochs=3
+n_epochs=20
 max_epochs_before_stop=100
 ie_dim=400
 max_rank=1000
@@ -83,7 +82,7 @@ python3 -u drums_rerank.py --mode train \
     --dataset $dataset \
     --encoder $encoder -k $k --gnn_dim $gnndim -elr $elr -dlr $dlr -bs $bs --max_rank $max_rank --seed $seed -mbs ${mbs} --unfreeze_epoch ${unfreeze_epoch} --encoder_layer=${encoder_layer} -sl ${max_seq_len} --max_node_num ${max_node_num} \
     --n_epochs $n_epochs --max_epochs_before_stop ${max_epochs_before_stop} --fp16 $fp16 --upcast $upcast --use_wandb false \
-    --save_dir ${save_dir_pref}/${dataset}/${run_name} --save_model 0 \
+    --save_dir ${save_dir_pref}/${dataset}/${run_name} --save_model 1 \
     --run_name ${run_name} \
     --load_model_path $load_model_path \
     --residual_ie $residual_ie \

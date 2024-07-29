@@ -77,7 +77,6 @@ def load_concepts(filepath):
             concepts[line.strip()] = i
     return concepts
 
-
 def index_pubmed_docs(pubmed_path):
 
     total_files = 1167  # Total number of files to process

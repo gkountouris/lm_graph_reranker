@@ -85,8 +85,40 @@ class MLP(nn.Module):
 
     def forward(self, input):
         return self.layers(input)
+        
 
+class ScoreCombinerNN(nn.Module):
+    def __init__(self, hidden_size1, hidden_size2, dropout_p=0.5):
+        super(ScoreCombinerNN, self).__init__()
+        self.layer1 = nn.Linear(2, hidden_size1)
+        self.bn1 = nn.BatchNorm1d(hidden_size1)  # Normalize across the features
+        self.dropout1 = nn.Dropout(dropout_p)
+        self.layer2 = nn.Linear(hidden_size1, hidden_size2)
+        self.bn2 = nn.BatchNorm1d(hidden_size2)  # Again, normalize across the features
+        self.dropout2 = nn.Dropout(dropout_p)
+        self.output_layer = nn.Linear(hidden_size2, 1)
+        self.relu = nn.ReLU()
 
+    def forward(self, x):
+        x = self.layer1(x)
+        # Apply batch normalization correctly for the given dimensionality
+        x = x.permute(0, 2, 1)  # Change to [batch_size, num_features, 1000]
+        x = self.bn1(x)
+        x = x.permute(0, 2, 1)  # Change back to [batch_size, 1000, num_features]
+        x = self.dropout1(x)
+        x = self.relu(x)
+
+        x = self.layer2(x)
+        x = x.permute(0, 2, 1)  # Same pattern for the second layer
+        x = self.bn2(x)
+        x = x.permute(0, 2, 1)
+        x = self.dropout2(x)
+        x = self.relu(x)
+
+        x = self.output_layer(x)
+        return x
+
+    
 class MaxPoolLayer(nn.Module):
     """
     A layer that performs max pooling along the sequence dimension
@@ -145,6 +177,41 @@ def dropout_mask(x, sz, p: float):
     (adapted from https://github.com/fastai/fastai/blob/1.0.42/fastai/text/models/awd_lstm.py)
     """
     return x.new(*sz).bernoulli_(1 - p).div_(1 - p)
+
+# class CrossAttention(nn.Module):
+#     """
+#     A cross attention layer.
+
+#     Parameters:
+#         query_dim (`int`): The number of channels in the query.
+#         cross_attention_dim (`int`, *optional*):
+#             The number of channels in the encoder_hidden_states. If not given, defaults to `query_dim`.
+#         heads (`int`,  *optional*, defaults to 8): The number of heads to use for multi-head attention.
+#         dim_head (`int`,  *optional*, defaults to 64): The number of channels in each head.
+#         dropout (`float`, *optional*, defaults to 0.0): The dropout probability to use.
+#         bias (`bool`, *optional*, defaults to False):
+#             Set to `True` for the query, key, and value linear layers to contain a bias parameter.
+#     """
+#     def __init__(self, emb: nn.Module, embed_p: float):
+#         super().__init__()
+#         self.emb, self.embed_p = emb, embed_p
+#         self.pad_idx = self.emb.padding_idx
+#         if self.pad_idx is None:
+#             self.pad_idx = -1
+
+#     def forward(self, words):
+
+#         query = attn.to_q(hidden_states)
+#         query = attn.head_to_batch_dim(query)
+
+#         encoder_hidden_states = encoder_hidden_states if encoder_hidden_states is not None else hidden_states
+#         key = attn.to_k(encoder_hidden_states)
+#         value = attn.to_v(encoder_hidden_states)
+#         key = attn.head_to_batch_dim(key)
+#         value = attn.head_to_batch_dim(value)
+
+#         attention_probs = attn.get_attention_scores(query, key, attention_mask)
+#         hidden_states = torch.bmm(attention_probs, value)
 
 
 class EmbeddingDropout(nn.Module):
@@ -273,6 +340,27 @@ class TripleEncoder(nn.Module):
         return self.output_dropout(outputs)
 
 
+class ScoreAttention(nn.Module):
+    def __init__(self, score_dim):
+        super(ScoreAttention, self).__init__()
+        self.score_dim = score_dim
+        self.query_projection = nn.Linear(score_dim, score_dim)
+        self.key_projection = nn.Linear(score_dim, score_dim)
+        
+    def forward(self, query_scores, key_scores, value_scores):
+        # Project scores
+        query_projected = self.query_projection(query_scores.unsqueeze(-1))
+        key_projected = self.key_projection(key_scores.unsqueeze(-1))
+        
+        # Compute attention weights
+        attn_weights = torch.bmm(query_projected, key_projected.transpose(1, 2))
+        attn_weights = F.softmax(attn_weights, dim=-1)
+        
+        # Apply attention weights to value scores
+        attended_scores = torch.bmm(attn_weights, value_scores.unsqueeze(-1)).squeeze(-1)
+        
+        return attended_scores
+
 class MatrixVectorScaledDotProductAttention(nn.Module):
 
     def __init__(self, temperature, attn_dropout=0.1):
@@ -307,7 +395,7 @@ class MatrixVectorScaledDotProductAttention(nn.Module):
         else:
             attn = (q.float().unsqueeze(1) * (k.float() / self.temperature)).sum(2)  # (n*b, l)
 
-        #V4
+        # V4
         # Qmax = torch.abs(q).max().detach().item()
         # Kmax = torch.abs(k).max().detach().item()
         # if Qmax < 0.5 and Kmax < 0.5:
@@ -630,8 +718,10 @@ class CustomizedEmbedding(nn.Module):
                 # for key, value in pretrained_concept_emb.items():
                 #     pretrained_concept_emb[key] = torch.tensor(value, dtype=torch.float32)  # Assuming float32 data type
                 #     self.emb.weight.data[:concept_num].copy_(pretrained_concept_emb)
-            else:
+            elif random_ent_emb:
                 self.emb.weight.data.normal_(mean=0.0, std=init_range)
+            else:
+                pass
             if freeze_ent_emb:
                 freeze_net(self.emb)
 

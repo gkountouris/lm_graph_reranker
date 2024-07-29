@@ -24,11 +24,12 @@ def add_data_arguments(parser):
     parser.add_argument('--data_dir', default='data', type=str, help='Path to the data directory')
     parser.add_argument('-ih', '--inhouse', type=utils.bool_flag, nargs='?', const=True, help='run in-house setting')
     parser.add_argument('--inhouse_train_qids', default='data/{dataset}/inhouse_split_qids.txt', help='qids of the in-house training set')
+    
     # statements
-    parser.add_argument('--train_statements', default='{data_dir}/{dataset}/statement/train_midle.statement.jsonl')
-    parser.add_argument('--dev_statements', default='{data_dir}/{dataset}/statement/dev_midle.statement.jsonl')
-    parser.add_argument('--test_statements', default='{data_dir}/{dataset}/statement/test_midle.statement.jsonl')
-    # preprocessing options
+    parser.add_argument('--train_statements', default='{data_dir}/{dataset}/statement/BioASQ-task12bPhaseA-testset4.statement.jsonl')
+    parser.add_argument('--dev_statements', default='{data_dir}/{dataset}/statement/BioASQ-task12bPhaseA-testset4.statement.jsonl')
+    parser.add_argument('--test_statements', default='{data_dir}/{dataset}/statement/BioASQ-task12bPhaseA-testset4.statement.jsonl')
+    # preprocessing options  
     parser.add_argument('-sl', '--max_seq_len', default=100, type=int)
     # set dataset defaults
     args, _ = parser.parse_known_args()
@@ -66,7 +67,7 @@ def add_optimization_arguments(parser):
 
 def add_additional_arguments(parser):
     parser.add_argument('--log_interval', default=10, type=int)
-    parser.add_argument('--cuda', default=False, type=utils.bool_flag, nargs='?', const=True, help='use GPU')
+    parser.add_argument('--cuda', default=True, type=utils.bool_flag, nargs='?', const=True, help='use GPU')
     parser.add_argument('--seed', default=0, type=int, help='random seed')
     parser.add_argument('--debug', default=False, type=utils.bool_flag, nargs='?', const=True, help='run in debug mode')
     args, _ = parser.parse_known_args()
@@ -82,3 +83,4 @@ def get_parser():
     add_optimization_arguments(parser)
     add_additional_arguments(parser)
     return parser
+

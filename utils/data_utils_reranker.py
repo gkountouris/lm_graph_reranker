@@ -20,7 +20,6 @@ except:
 
 from utils import utils
 
-
 MODEL_CLASS_TO_NAME = {
     'gpt': list(OPENAI_GPT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
     'bert': list(BERT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
@@ -28,7 +27,6 @@ MODEL_CLASS_TO_NAME = {
     'roberta': list(ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
     'lstm': ['lstm'],
 }
-
 try:
     MODEL_CLASS_TO_NAME['albert'] =  list(ALBERT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys())
 except:
@@ -53,20 +51,11 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
     def __init__(self, args, devices, batch_size, indexes, qids, labels, tf_idf_tensors,
                  tensors0=[], lists0=[], tensors1=[], lists1=[], adj_data=None, tokenizer=None):
 
-        print('BATCH SIZE', batch_size, file=sys.stderr)
-        labels_list = []
-        for s in labels:
-            try:
-                labels_list.append(int(s))
-            except ValueError:
-                # Handle the exception or ignore the value
-                print(f"Cannot convert {s} to an integer.")
-
         self.args = args
         self.batch_size = batch_size
         self.indexes = indexes
         self.qids = qids
-        self.labels = torch.tensor(labels_list, dtype=torch.int64)
+        self.labels = torch.tensor(labels)
         self.tf_idf_tensors = tf_idf_tensors
         self.tensors0 = tensors0
         self.lists0 = lists0
@@ -75,8 +64,7 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
         self.adj_data = adj_data
         self.tokenizer = tokenizer
         self.devices = devices
-        
-        
+
         self.mlm_probability = args.mlm_probability
         if args.span_mask:
             print ('span_mask', args.span_mask, file=sys.stderr)
@@ -99,9 +87,8 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
             b = min(n, a + bs)
             batch_indexes = self.indexes[a:b]
             batch_qids = [self.qids[idx] for idx in batch_indexes]
-            batch_labels = self._to_device(self.labels[batch_indexes], self.devices[2])
+            batch_labels = self._to_device(self.labels[batch_indexes], self.devices[0])
 
-            batch_tf_idf = [self._to_device(self.tf_idf_tensors[qids], self.devices[2]) for qids in batch_qids]
             batch_tensors0 = [self._to_device(x[batch_indexes], self.devices[1]) for x in self.tensors0]
             assert len(batch_tensors0) == 4 #tensors0: all_input_ids, all_input_mask, all_segment_ids, all_output_mask
             batch_lm_inputs, batch_lm_labels = self.process_lm_data(batch_tensors0)
@@ -109,19 +96,24 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
             batch_tensors1 = [self._to_device(x[batch_indexes], self.devices[1]) for x in self.tensors1]
             assert len(batch_tensors1) == 5 #tensors1: concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask
             batch_tensors1[0] = batch_tensors1[0].to(self.devices[0])
+
+            doc_dense_tensor = torch.stack([self._to_device(self.tf_idf_tensors[qids]['dense_matrix'], self.devices[2]) for qids in batch_qids])
+            doc_pos_labels_tensor = torch.stack([self._to_device(self.tf_idf_tensors[qids]['dense_mask'], self.devices[2]) for qids in batch_qids])
+            doc_labels_tensor = torch.stack([self._to_device(self.tf_idf_tensors[qids]['unique_labels'], self.devices[2]) for qids in batch_qids])
+
             batch_lists0 = [self._to_device([x[i] for i in batch_indexes], self.devices[0]) for x in self.lists0]
             batch_lists1 = [self._to_device([x[i] for i in batch_indexes], self.devices[1]) for x in self.lists1]
 
             edge_index_all, edge_type_all = self.adj_data
             #edge_index_all: nested list of shape (n_samples, num_choice), where each entry is tensor[2, E]
             #edge_type_all:  nested list of shape (n_samples, num_choice), where each entry is tensor[E, ]
-            edge_index = self._to_device([edge_index_all[i] for i in batch_indexes], self.devices[1])
-            edge_type  = self._to_device([edge_type_all[i] for i in batch_indexes], self.devices[1])
+            edge_index = self._to_device([edge_index_all[i] for i in batch_indexes], self.devices[0])
+            edge_type  = self._to_device([edge_type_all[i] for i in batch_indexes], self.devices[0])
             node_type_ids = batch_tensors1[1] #[bs, nc, n_nodes]
             assert node_type_ids.dim() == 3
             edge_index, edge_type, pos_triples, neg_nodes = self.process_graph_data(edge_index, edge_type, node_type_ids)
 
-            yield tuple([batch_qids, batch_labels, batch_lm_inputs, batch_lm_labels, *batch_tensors0, *batch_lists0, *batch_tensors1, *batch_lists1, edge_index, edge_type, pos_triples, neg_nodes, batch_tf_idf])
+            yield tuple([batch_qids, batch_labels, batch_lm_inputs, batch_lm_labels, *batch_tensors0, *batch_lists0, *batch_tensors1, *batch_lists1, edge_index, edge_type, pos_triples, neg_nodes, doc_dense_tensor, doc_pos_labels_tensor, doc_labels_tensor])
 
     def _to_device(self, obj, device):
         if isinstance(obj, (tuple, list)):
@@ -389,7 +381,6 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
         real_mask = torch.zeros((E,)).long() #[E, ]
         real_mask = real_mask.index_fill_(dim=0, index=real_drop_positions, value=1).bool().to(device) #[E, ]
 
-
         assert int(mask.long().sum()) == drop_count
         # print (f'drop_E / total_E = {drop_count} / {E} = {drop_count / E}', ) #E is typically 1000-3000
         input_edge_index = _edge_index[:, ~real_mask]
@@ -444,8 +435,8 @@ class DRUMS_DataLoader(object):
         *self.train_decoder_data, self.train_adj_data = self.load_sparse_adj_data_with_contextnode(train_adj_path, max_node_num, train_concepts_by_sents_list, mode='train')
         if not debug:
             assert all(len(self.train_qids) == len(self.train_adj_data[0]) == len(x) for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
-        self.train_tensor_matrix = torch.load(train_tensor_path)
-
+        self.train_doc_matrix = self.load_sparse_tf_tensor_data_with_contextnode(train_tensor_path, max_node_num, self.train_decoder_data[0], self.train_qids, self.train_labels)
+        # self.train_tensor_matrix = torch.load(train_tensor_path)
         print("Finish loading training data.")
 
         # Load dev data
@@ -453,8 +444,7 @@ class DRUMS_DataLoader(object):
         *self.dev_decoder_data, self.dev_adj_data = self.load_sparse_adj_data_with_contextnode(dev_adj_path, max_node_num, dev_concepts_by_sents_list)
         if not debug:
             assert all(len(self.dev_qids) == len(self.dev_adj_data[0]) == len(x) for x in [self.dev_labels] + self.dev_encoder_data + self.dev_decoder_data)
-        self.dev_tensor_matrix = torch.load(dev_tensor_path)
-
+        self.dev_doc_matrix = self.load_sparse_tf_tensor_data_with_contextnode(dev_tensor_path, max_node_num, self.dev_decoder_data[0], self.dev_qids, self.dev_labels)
         print("Finish loading dev data.")
 
         # Load test data
@@ -463,9 +453,8 @@ class DRUMS_DataLoader(object):
             *self.test_decoder_data, self.test_adj_data = self.load_sparse_adj_data_with_contextnode(test_adj_path, max_node_num, test_concepts_by_sents_list)
             if not debug:
                 assert all(len(self.test_qids) == len(self.test_adj_data[0]) == len(x) for x in [self.test_labels] + self.test_encoder_data + self.test_decoder_data)
-        self.test_tensor_matrix = torch.load(test_tensor_path)
-
-        print("Finish loading test data.")
+            self.test_doc_matrix = self.load_sparse_tf_tensor_data_with_contextnode(test_tensor_path, max_node_num, self.test_decoder_data[0], self.test_qids, self.test_labels)
+            print("Finish loading test data.")
 
         # If using inhouse split, we split the original training set into an inhouse training set and an inhouse test set.
         if self.is_inhouse:
@@ -517,17 +506,17 @@ class DRUMS_DataLoader(object):
 
         print ('local_rank', local_rank, 'len(train_indexes)', len(train_indexes), 'train_indexes[:10]', train_indexes[:10].tolist())
         print ('local_rank', local_rank, 'len(train_indexes)', len(train_indexes), 'train_indexes[:10]', train_indexes[:10].tolist(), file=sys.stderr)
-        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.batch_size, train_indexes, self.train_qids, self.train_labels, self.train_tensor_matrix, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
-
+        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.batch_size, train_indexes, self.train_qids, self.train_labels, self.train_doc_matrix, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
+                
     def train_eval(self):
-        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, torch.arange(len(self.train_qids)), self.train_qids, self.train_labels, self.train_tensor_matrix, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
+        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.batch_size, train_indexes, self.train_qids, self.train_labels, self.train_doc_matrix, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
 
     def dev(self):
         if self.debug:
             dev_indexes = torch.arange(self.debug_sample_size)
         else:
             dev_indexes = torch.arange(len(self.dev_qids))
-        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, dev_indexes, self.dev_qids, self.dev_labels, self.dev_tensor_matrix, tensors0=self.dev_encoder_data, tensors1=self.dev_decoder_data, adj_data=self.dev_adj_data, tokenizer=self.tokenizer)
+        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, dev_indexes, self.dev_qids, self.dev_labels, self.dev_doc_matrix, tensors0=self.dev_encoder_data, tensors1=self.dev_decoder_data, adj_data=self.dev_adj_data, tokenizer=self.tokenizer)
 
     def test(self):
         if self.debug:
@@ -537,9 +526,9 @@ class DRUMS_DataLoader(object):
         else:
             test_indexes = torch.arange(len(self.test_qids))
         if self.is_inhouse:
-            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.train_qids, self.train_labels, self.train_tensor_matrix, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
+            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.train_qids, self.train_labels, self.train_doc_matrix, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
         else:
-            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.test_qids, self.test_labels, self.test_tensor_matrix, tensors0=self.test_encoder_data, tensors1=self.test_decoder_data, adj_data=self.test_adj_data, tokenizer=self.tokenizer)
+            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.test_qids, self.test_labels, self.test_doc_matrix, tensors0=self.test_encoder_data, tensors1=self.test_decoder_data, adj_data=self.test_adj_data, tokenizer=self.tokenizer)
 
     def load_resources(self, kg):
         # Load the tokenizer
@@ -550,7 +539,36 @@ class DRUMS_DataLoader(object):
         tokenizer = tokenizer_class.from_pretrained(self.model_name)
         self.tokenizer = tokenizer
 
-        if kg == "umls":
+        if kg == "cpnet":
+            # Load cpnet
+            cpnet_vocab_path = self.args.kg_vocab_path #"data/cpnet/concept.txt"
+            with open(cpnet_vocab_path, "r", encoding="utf8") as fin:
+                self.id2concept = [w.strip() for w in fin]
+            self.concept2id = {w: i for i, w in enumerate(self.id2concept)}
+            self.id2relation = conceptnet.merged_relations
+        elif kg == "ddb":
+            cpnet_vocab_path = self.args.kg_vocab_path #"data/ddb/vocab.txt"
+            with open(cpnet_vocab_path, "r", encoding="utf8") as fin:
+                self.id2concept = [w.strip() for w in fin]
+            self.concept2id = {w: i for i, w in enumerate(self.id2concept)}
+            self.id2relation = [
+                'belongstothecategoryof',
+                'isacategory',
+                'maycause',
+                'isasubtypeof',
+                'isariskfactorof',
+                'isassociatedwith',
+                'maycontraindicate',
+                'interactswith',
+                'belongstothedrugfamilyof',
+                'child-parent',
+                'isavectorfor',
+                'mabeallelicwith',
+                'seealso',
+                'isaningradientof',
+                'mabeindicatedby'
+            ]
+        elif kg == "umls":
             cpnet_vocab_path = self.args.kg_vocab_path #"data/umls/concepts.txt"
             with open(cpnet_vocab_path, "r", encoding="utf8") as fin:
                 self.id2concept = [w.strip() for w in fin]
@@ -562,11 +580,11 @@ class DRUMS_DataLoader(object):
     def load_input_tensors(self, input_jsonl_path, max_seq_length, mode='eval'):
         """Construct input tensors for the LM component of the model."""
         cache_path = input_jsonl_path + "-sl{}".format(max_seq_length) + (("-" + self.model_type) if self.model_type != "roberta" else "") + '.loaded_cache'
-        use_cache = False
+        use_cache = True
 
         if use_cache and not os.path.exists(cache_path):
             use_cache = False
-        use_cache = False         
+            
         if use_cache:
             print (f'Loading cache {cache_path}')
             print (f'Loading cache {cache_path}', file=sys.stderr)
@@ -604,7 +622,7 @@ class DRUMS_DataLoader(object):
                         for _i_, obj in enumerate(tqdm(input_tensors)):
                             pickle.dump({f'obj{_i_}': obj}, f, protocol=4)
                     print ('saved cache.', file=sys.stderr)
-                    
+
         if mode == 'train' and self.args.local_rank != -1:
             example_ids, all_label, data_tensors, concepts_by_sents_list = input_tensors #concepts_by_sents_list is always []
             assert len(example_ids) == len(all_label) == len(data_tensors[0])
@@ -628,20 +646,99 @@ class DRUMS_DataLoader(object):
         print ('local_rank', self.args.local_rank, 'len(example_ids)', len(example_ids), file=sys.stderr)
         return input_tensors
 
+    def load_sparse_tf_tensor_data_with_contextnode(self, input_jsonl_path, max_seq_length, concept_ids, q_ids, labels, mode='eval'):
+        """Construct input tensors for the LM component of the model."""
+        cache_path = input_jsonl_path + "-sl{}".format(max_seq_length) + (("-" + self.model_type) if self.model_type != "roberta" else "") + '.loaded_cache'
+        use_cache = True
+
+        if use_cache and not os.path.exists(cache_path):
+            use_cache = False
+            
+        if use_cache:
+            print (f'Loading cache {cache_path}')
+            print (f'Loading cache {cache_path}', file=sys.stderr)
+            dense_tensors_dict = {}
+            with open(cache_path, 'rb') as in_file:
+                try:
+                    dense_tensors_dict = pickle.load(in_file)
+                except EOFError:
+                    pass
+            print (f'Loaded cache {cache_path}', file=sys.stderr)
+        else:
+            tf_idf_tensors = torch.load(input_jsonl_path)
+            
+            dense_tensors_dict = {}  # Initialize an empty dictionary
+
+            for _idx, ids in tqdm(enumerate(q_ids), total=len(q_ids), desc='loading tf tensor matrices'):
+                tf_labels_ids = tf_idf_tensors[ids].coalesce().indices()[0]
+                tf_concept_ids = tf_idf_tensors[ids].coalesce().indices()[1]
+                tf_values = tf_idf_tensors[ids].coalesce().values()
+
+                true_label = labels[_idx]
+
+                # Initialize the dense tensor for this query
+                dense_matrix = torch.zeros(100, max_seq_length)
+                dense_mask = torch.zeros(100, 1)
+
+                # Get the unique labels and concepts for indexing
+                unique_labels, label_indices = torch.unique(tf_labels_ids, return_inverse=True)
+                ordered_concepts = concept_ids[_idx]
+                
+                # Initialize a dense tensor of zeros with shape [100, 1]
+                dense_unique = torch.zeros(100, 1, dtype=unique_labels.dtype)
+                # Determine the number of unique labels to copy into the dense tensor
+                num_labels_to_copy = min(len(unique_labels), 100)
+                # Copy the unique labels into the dense tensor
+                dense_unique[:num_labels_to_copy, 0] = unique_labels[:num_labels_to_copy]
+
+                true_label_pos = (unique_labels == true_label).nonzero(as_tuple=True)[0]
+                # Check if the true label was found in unique_labels
+                if len(true_label_pos) > 0:
+                    # Set the value at this position to 1 in dense_mask
+                    dense_mask[true_label_pos] = 1
+                else:
+                    dense_mask[99] = 1
+
+                # Map concept IDs to their positions in ordered_concepts
+                concept_position_mapping = {id.item(): pos for pos, id in enumerate(ordered_concepts.squeeze(0))}
+                for label, concept, value in zip(tf_labels_ids, tf_concept_ids, tf_values):
+                    # Find the row position for the label in dense_matrix
+                    label_pos = label_indices[torch.where(tf_labels_ids == label)[0][0]].item()
+                    # Find the column position for the concept in dense_matrix
+                    concept_pos = concept_position_mapping.get(concept.item(), -1)
+                    # If the concept is found in ordered_concepts, update the corresponding position in dense_matrix
+                    if concept_pos != -1:
+                        dense_matrix[label_pos, concept_pos] = value
+
+                # Add the populated dense_matrix to the dictionary with ids as the key
+                dense_tensors_dict[ids] = {'dense_matrix': dense_matrix, 'dense_mask': dense_mask, 'unique_labels': dense_unique}
+                
+            if not self.debug:
+                if self.args.local_rank in [-1, 0]:
+                    print('saving cache...', file=sys.stderr)
+                    
+                    # Save the entire dictionary in one go
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(dense_tensors_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    print('saved cache.', file=sys.stderr)
+
+        return dense_tensors_dict
+
     def load_sparse_adj_data_with_contextnode(self, adj_pk_path, max_node_num, concepts_by_sents_list, mode='eval'):
         """Construct input tensors for the GNN component of the model."""
-        print("Loading sparse adj data...", file=sys.stderr)
+        print("Loading sparse adj data...")
         cache_path = adj_pk_path + "-nodenum{}".format(max_node_num) + ("-cntsall" if self.cxt_node_connects_all else "") + '.loaded_cache'
         # use_cache = self.args.dump_graph_cache
         use_cache = self.args.load_graph_cache
 
         if use_cache and not os.path.exists(cache_path):
             use_cache = False
-        use_cache = False             
+            
         if use_cache:
             print (f'Loading cache {cache_path}')
             print (f'Loading cache {cache_path}', file=sys.stderr)
-            
+            # with open(cache_path, 'rb') as f:
+            #     adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel, special_nodes_mask = utils.CPU_Unpickler(f).load()
             loaded_data = []
             with open(cache_path, "rb") as in_file:
                 try:
@@ -657,7 +754,6 @@ class DRUMS_DataLoader(object):
                             raise TypeError("Invalid type for obj.")
                 except EOFError:
                     pass
-
             adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel, special_nodes_mask = loaded_data
             self.final_num_relation = half_n_rel
             print (f'Loaded cache {cache_path}', file=sys.stderr)
@@ -665,7 +761,7 @@ class DRUMS_DataLoader(object):
             ori_adj_mean  = adj_lengths_ori.float().mean().item()
             ori_adj_sigma = np.sqrt(((adj_lengths_ori.float() - ori_adj_mean)**2).mean().item())
             print('| ori_adj_len: mu {:.2f} sigma {:.2f} | adj_len: {:.2f} |'.format(ori_adj_mean, ori_adj_sigma, adj_lengths.float().mean().item()) +
-                ' prune_rate: {:.2f} |'.format((adj_lengths_ori > adj_lengths).float().mean().item()) +
+                ' prune_rate： {:.2f} |'.format((adj_lengths_ori > adj_lengths).float().mean().item()) +
                 ' qc_num: {:.2f} | ac_num: {:.2f} |'.format((node_type_ids == 0).float().sum(1).mean().item(),
                                                             (node_type_ids == 1).float().sum(1).mean().item()))
 
@@ -721,7 +817,7 @@ class DRUMS_DataLoader(object):
                         elif type(ex) == tuple:
                             adj_concept_pairs.append(ex)
                         elif type(ex) == list:
-                            assert len(ex) > 2
+                            assert len(ex) > 10
                             adj_concept_pairs.extend(ex)
                         else:
                             raise TypeError("Invalid type for ex.")
@@ -744,7 +840,7 @@ class DRUMS_DataLoader(object):
 
             edge_index, edge_type = [], []
             adj_lengths = torch.zeros((n_samples,), dtype=torch.long)
-            concept_ids = torch.full((n_samples, max_node_num), 1, dtype=torch.long)
+            concept_ids = torch.full((n_samples, max_node_num), 0, dtype=torch.long)
             node_type_ids = torch.full((n_samples, max_node_num), 2, dtype=torch.long) #default 2: "other node"
             node_scores = torch.zeros((n_samples, max_node_num, 1), dtype=torch.float)
             special_nodes_mask = torch.zeros(n_samples, max_node_num, dtype=torch.bool)
@@ -768,7 +864,6 @@ class DRUMS_DataLoader(object):
                 else:
                     adj, concepts, qm, am = _data
                     cid2score = None
-                        
                 #adj: e.g. <4233x249 (n_nodes*half_n_rels x n_nodes) sparse matrix of type '<class 'numpy.bool'>' with 2905 stored elements in COOrdinate format>
                 #concepts: np.array(num_nodes, ), where entry is concept id
                 #qm: np.array(num_nodes, ), where entry is True/False
@@ -787,10 +882,10 @@ class DRUMS_DataLoader(object):
                         F_start = True
                     else:
                         assert F_start == False
-                        
+
                 assert n_special_nodes <= max_node_num
                 special_nodes_mask[idx, :n_special_nodes] = 1
-                
+
                 actual_max_node_num = max_node_num
                 num_concept = min(len(concepts) + n_special_nodes, actual_max_node_num) #this is the final number of nodes including contextnode but excluding PAD
                 adj_lengths_ori[idx] = len(concepts)
@@ -814,7 +909,7 @@ class DRUMS_DataLoader(object):
                 node_type_ids[idx, 1:n_special_nodes] = 4 # sent nodes
                 node_type_ids[idx, n_special_nodes:num_concept][torch.tensor(qm, dtype=torch.bool)[:num_concept - n_special_nodes]] = 0
                 node_type_ids[idx, n_special_nodes:num_concept][torch.tensor(am, dtype=torch.bool)[:num_concept - n_special_nodes]] = 1
-                node_type_ids[idx, len(concepts) + 1:] = 2
+                # node_type_ids[idx, len(concepts) + 1:] = 4
 
                 #Load adj
                 ij = torch.tensor(adj.row, dtype=torch.int64) #(num_matrix_entries, ), where each entry is coordinate
@@ -825,6 +920,14 @@ class DRUMS_DataLoader(object):
                     i, j = ij // n_node, ij % n_node
                 else:
                     i, j = ij, ij
+
+                # if n_node > 0:
+                #     assert len(self.id2relation) == adj.shape[0] // n_node
+                #     i = torch.div(ij, n_node, rounding_mode='floor')  # If you intended floor division
+                #     j = torch.div(ij, n_node, rounding_mode='floor')  # If you intended floor division
+                #     # If you want to maintain the current behavior, replace 'floor' with 'trunc'
+                # else:
+                #     i, j = ij, ij
 
                 #Prepare edges
                 i += 2; j += 1; k += 1  # **** increment coordinate by 1, rel_id by 2 ****
@@ -891,7 +994,7 @@ class DRUMS_DataLoader(object):
             ori_adj_mean  = adj_lengths_ori.float().mean().item()
             ori_adj_sigma = np.sqrt(((adj_lengths_ori.float() - ori_adj_mean)**2).mean().item())
             print('| ori_adj_len: mu {:.2f} sigma {:.2f} | adj_len: {:.2f} |'.format(ori_adj_mean, ori_adj_sigma, adj_lengths.float().mean().item()) +
-                ' prune_rate: {:.2f} |'.format((adj_lengths_ori > adj_lengths).float().mean().item()) +
+                ' prune_rate： {:.2f} |'.format((adj_lengths_ori > adj_lengths).float().mean().item()) +
                 ' qc_num: {:.2f} | ac_num: {:.2f} |'.format((node_type_ids == 0).float().sum(1).mean().item(),
                                                             (node_type_ids == 1).float().sum(1).mean().item()))
 
@@ -903,8 +1006,83 @@ class DRUMS_DataLoader(object):
             #node_type_ids: (n_questions, num_choice, max_node_num)
             #node_scores: (n_questions, num_choice, max_node_num)
             #adj_lengths: (n_questions,　num_choice)
-            
         return concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, (edge_index, edge_type) #, half_n_rel * 2 + 1
+
+
+######################### GPT loader utils #########################
+def load_gpt_input_tensors(statement_jsonl_path, max_seq_length):
+    def _truncate_seq_pair(tokens_a, tokens_b, max_length):
+        """Truncates a sequence pair in place to the maximum length."""
+        while True:
+            total_length = len(tokens_a) + len(tokens_b)
+            if total_length <= max_length:
+                break
+            if len(tokens_a) > len(tokens_b):
+                tokens_a.pop()
+            else:
+                tokens_b.pop()
+
+    def load_qa_dataset(dataset_path):
+        """ Output a list of tuples(story, 1st continuation, 2nd continuation, label) """
+        with open(dataset_path, "r", encoding="utf-8") as fin:
+            output = []
+            for line in fin:
+                input_json = json.loads(line)
+                label = ord(input_json.get("answerKey", "A")) - ord("A")
+                output.append((input_json['id'], input_json["question"]["stem"], *[ending["text"] for ending in input_json["question"]["choices"]], label))
+        return output
+
+    def pre_process_datasets(encoded_datasets, num_choices, max_seq_length, start_token, delimiter_token, clf_token):
+        """ Pre-process datasets containing lists of tuples(story, 1st continuation, 2nd continuation, label)
+
+            To Transformer inputs of shape (n_batch, n_alternative, length) comprising for each batch, continuation:
+            input_ids[batch, alternative, :] = [start_token] + story[:cap_length] + [delimiter_token] + cont1[:cap_length] + [clf_token]
+        """
+        tensor_datasets = []
+        for dataset in encoded_datasets:
+            n_batch = len(dataset)
+            input_ids = np.zeros((n_batch, num_choices, max_seq_length), dtype=np.int64)
+            mc_token_ids = np.zeros((n_batch, num_choices), dtype=np.int64)
+            lm_labels = np.full((n_batch, num_choices, max_seq_length), fill_value=-1, dtype=np.int64)
+            mc_labels = np.zeros((n_batch,), dtype=np.int64)
+            for i, data, in enumerate(dataset):
+                q, mc_label = data[0], data[-1]
+                choices = data[1:-1]
+                for j in range(len(choices)):
+                    _truncate_seq_pair(q, choices[j], max_seq_length - 3)
+                    qa = [start_token] + q + [delimiter_token] + choices[j] + [clf_token]
+                    input_ids[i, j, :len(qa)] = qa
+                    mc_token_ids[i, j] = len(qa) - 1
+                    lm_labels[i, j, :len(qa) - 1] = qa[1:]
+                mc_labels[i] = mc_label
+            all_inputs = (input_ids, mc_token_ids, lm_labels, mc_labels)
+            tensor_datasets.append(tuple(torch.tensor(t) for t in all_inputs))
+        return tensor_datasets
+
+    def tokenize_and_encode(tokenizer, obj):
+        """ Tokenize and encode a nested object """
+        if isinstance(obj, str):
+            return tokenizer.convert_tokens_to_ids(tokenizer.tokenize(obj))
+        elif isinstance(obj, int):
+            return obj
+        else:
+            return list(tokenize_and_encode(tokenizer, o) for o in obj)
+
+    tokenizer = OpenAIGPTTokenizer.from_pretrained('openai-gpt')
+    tokenizer.add_tokens(GPT_SPECIAL_TOKENS)
+    special_tokens_ids = tokenizer.convert_tokens_to_ids(GPT_SPECIAL_TOKENS)
+
+    dataset = load_qa_dataset(statement_jsonl_path)
+    examples_ids = [data[0] for data in dataset]
+    dataset = [data[1:] for data in dataset]  # discard example ids
+    num_choices = len(dataset[0]) - 2
+
+    encoded_dataset = tokenize_and_encode(tokenizer, dataset)
+
+    (input_ids, mc_token_ids, lm_labels, mc_labels), = pre_process_datasets([encoded_dataset], num_choices, max_seq_length, *special_tokens_ids)
+    return examples_ids, mc_labels, input_ids, mc_token_ids, lm_labels
+
+
 
 
 ######################### BERT/XLNet/Roberta loader utils #########################
@@ -930,7 +1108,6 @@ class InputFeatures(object):
         ]
         self.label = label
 
-
 def read_query_examples(input_file):
     with open(input_file, "r", encoding="utf-8") as f:
         examples = []
@@ -953,7 +1130,6 @@ def pad_or_truncate(sequence, max_length):
         return sequence + [0] * (max_length - len(sequence))  # Pad
     return sequence
 
-
 def simple_convert_query_examples_to_features(examples, max_seq_length, tokenizer, debug=False):
     """ Loads a data file into a list of `InputBatch`s
         `cls_token_at_end` define the location of the CLS token:
@@ -961,13 +1137,10 @@ def simple_convert_query_examples_to_features(examples, max_seq_length, tokenize
             - True (XLNet/GPT pattern): A + [SEP] + B + [SEP] + [CLS]
         `cls_token_segment_id` define the segment id associated to the CLS token (0 for BERT, 2 for XLNet)
     """
-    
+
     features = []
     concepts_by_sents_list = []
-    debug_sample_size = 10
     for ex_index, example in tqdm(enumerate(examples), total=len(examples), desc="Converting examples to features"):
-        if debug and ex_index >= debug_sample_size:
-            break
         choices_features = []
 
         question = example.question
@@ -985,11 +1158,10 @@ def simple_convert_query_examples_to_features(examples, max_seq_length, tokenize
         assert len(segment_ids) == max_seq_length
 
         choices_features.append((input_ids, input_mask, segment_ids, output_mask))
-        label = example.label
+        label = int(example.label)
         features.append(InputFeatures(example_id=example.example_id, choices_features=choices_features, label=label))
 
     return features, concepts_by_sents_list
-
 
 def load_bert_query_input_tensors(statement_jsonl_path, max_seq_length, debug, tokenizer, debug_sample_size):
     def select_field(features, field):
@@ -1005,22 +1177,7 @@ def load_bert_query_input_tensors(statement_jsonl_path, max_seq_length, debug, t
 
     examples = read_query_examples(statement_jsonl_path)
 
-    num_workers = 1
-    if num_workers <= 1:
-        features, concepts_by_sents_list = simple_convert_query_examples_to_features(examples, max_seq_length, tokenizer, debug)
-    else:
-        from copy import deepcopy
-        from multiprocessing import Pool
-        c_size = len(examples)//num_workers +1
-        examples_list   = [examples[i*c_size: (i+1)*c_size]      for i in range(num_workers)]
-        max_seq_length_list = [max_seq_length      for i in range(num_workers)]
-        tokenizer_list      = [deepcopy(tokenizer) for i in range(num_workers)]
-        with Pool(num_workers) as p:
-            ress = list(p.starmap(simple_convert_query_examples_to_features, zip(examples_list, max_seq_length_list, tokenizer_list)))
-        features = []
-        for res in ress:
-            features += res[0]
-            concepts_by_sents_list += res[1]
+    features, concepts_by_sents_list = simple_convert_query_examples_to_features(examples, max_seq_length, tokenizer, debug)
 
     example_ids = [f.example_id for f in features]
     *data_tensors, all_label = convert_features_to_tensors(features)

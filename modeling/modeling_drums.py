@@ -65,7 +65,7 @@ class DRUMS(nn.Module):
         """
         n_examples = len(edge_index_init)
         edge_index = [edge_index_init[_i_] + _i_ * n_nodes for _i_ in range(n_examples)]
-        print(edge_index, file=sys.stderr)
+        
         edge_index = torch.cat(edge_index, dim=1) #[2, total_E]
         edge_type = torch.cat(edge_type_init, dim=0) #[total_E, ]
 
@@ -86,7 +86,7 @@ class DRUMS(nn.Module):
         assert pos_triples.size(1) == neg_nodes.size(0)
         return edge_index, edge_type, pos_triples, neg_nodes
 
-    def forward(self, *inputs, labels=None, tf_idf_matrix=None, cache_output=False, detail=False):
+    def forward(self, *inputs, labels=None, cache_output=False, detail=False):
         """
         inputs_ids: (batch_size, num_choice, seq_len)    -> (batch_size * num_choice, seq_len)
         concept_ids: (batch_size, num_choice, n_node)  -> (batch_size * num_choice, n_node)
@@ -104,7 +104,7 @@ class DRUMS(nn.Module):
         """
         bs, nc = inputs[0].size(0), inputs[0].size(1)
         #Here, merge the batch dimension and the num_choice dimension
-        assert len(inputs) == 6 + 5 + 2 + 2  #6 lm_data, 5 gnn_data, (edge_index, edge_type), (pos_triples, neg_nodes), tf_idf_matrix
+        assert len(inputs) == 6 + 5 + 2 + 2  # 15 #6 lm_data, 5 gnn_data, (edge_index, edge_type), (pos_triples, neg_nodes)
         edge_index_orig, edge_type_orig = inputs[-2:]
         _inputs = [x.reshape(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[:6]] + [x.reshape(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[6:11]] + [sum(x,[]) for x in inputs[11:15]]
 
@@ -115,8 +115,8 @@ class DRUMS(nn.Module):
         adj     = (edge_index.to(device), edge_type.to(device))
         lp_data = (pos_triples.to(device), neg_nodes.to(device))
         
-        logits, retrieval_loss, top_scores, lm_loss, link_losses = self.lmgnn(lm_inputs, concept_ids,
-                                    node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels, tf_idf_matrix,
+        logits, cls_embs, lm_loss, link_losses = self.lmgnn(lm_inputs, concept_ids,
+                                    node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels,
                                     emb_data=None, cache_output=cache_output)
         # logits: [bs * nc], lm_loss: scalar, link_losses: (scalar, scalar, scalar)
         if logits is not None:
@@ -124,9 +124,9 @@ class DRUMS(nn.Module):
         lm_loss = lm_loss * bs
         link_losses = [item * bs for item in link_losses]
         if not detail:
-            return logits, retrieval_loss, top_scores, lm_loss, link_losses
+            return logits, cls_embs, lm_loss, link_losses
         else:
-            return logits, retrieval_loss, top_scores, lm_loss, link_losses, concept_ids.view(bs, nc, -1), node_type_ids.view(bs, nc, -1), edge_index_orig, edge_type_orig
+            return logits, cls_embs, lm_loss, link_losses, concept_ids.view(bs, nc, -1), node_type_ids.view(bs, nc, -1), edge_index_orig, edge_type_orig
             # edge_index_orig: list of (batch_size, num_choice). each entry is torch.tensor(2, E)
             # edge_type_orig: list of (batch_size, num_choice). each entry is torch.tensor(E, )
 
@@ -243,80 +243,8 @@ class LMGNN(PreTrainedModelClass):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
             
-    def soft_topk(self, x, k, temperature=1.0):
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(x)))
-        x_with_noise = x + gumbel_noise
-        soft_scores = torch.nn.functional.softmax(x_with_noise / temperature, dim=0)  # Changed dim to 0
 
-        # Get top-k indices based on the soft scores
-        topk_indices = torch.topk(soft_scores, k, dim=0).indices  # Changed dim to 0
-
-        # Create a mask for the top-k elements
-        mask = torch.zeros_like(soft_scores, dtype=torch.bool).scatter_(dim=0, index=topk_indices, src=torch.ones_like(topk_indices, dtype=torch.bool))  # Changed dim to 0
-
-        # Apply the mask to keep only the top-k elements' scores
-        masked_soft_scores = soft_scores * mask
-
-        return masked_soft_scores
-    
-
-    def process_tf_idf_part(self, tf_idf_part, sublist, dense_tensor):
-
-        def slice_sparse_tensor(sparse_tensor, col_indices):
-            indices = sparse_tensor._indices()
-            values = sparse_tensor._values()
-
-            # Create a mask for the columns to select
-            mask = torch.isin(indices[1], col_indices)
-
-            # Apply the mask to select the corresponding values and indices
-            selected_indices = indices[:, mask]
-            selected_values = values[mask]
-
-            # Ensure col_indices is sorted
-            unique_col_indices, _ = torch.sort(col_indices)
-
-            # Use torch.searchsorted to find positions
-            remapped_cols = torch.searchsorted(unique_col_indices, selected_indices[1])
-
-            # Create the new indices tensor with remapped column indices
-            new_indices = torch.stack([selected_indices[0], remapped_cols])
-
-            # The shape should have the same number of rows and the length of col_indices
-            shape = [sparse_tensor.shape[0], len(col_indices)]
-
-            # Create the new sparse tensor
-            selected_tensor = torch.sparse_coo_tensor(new_indices, selected_values, torch.Size(shape)) #, requires_grad=True
-
-            return selected_tensor
-        
-        # Manually slice the sparse tensor
-        selected_cols_matrix = slice_sparse_tensor(tf_idf_part, sublist)
-
-        # Ensure dense_tensor is in the correct format
-        if dense_tensor.dim() == 1:
-            dense_tensor = dense_tensor.unsqueeze(1)  # Convert from [n] to [n, 1]
-
-        if dense_tensor.dim() > 2:  # Assuming you expect a 2D tensor
-            dense_tensor = torch.squeeze(dense_tensor)
-            print(f"New shape of dense tensor: {dense_tensor.shape}")
-            
-        # Convert to torch.float32 if they are not
-        if selected_cols_matrix.dtype != torch.float32:
-            selected_cols_matrix = selected_cols_matrix.to(torch.float32)
-
-        if dense_tensor.dtype != torch.float32:
-            dense_tensor = dense_tensor.to(torch.float32)
-
-        # If not on the same device, move them to the same device (e.g., 'cuda:0')
-        if selected_cols_matrix.device != dense_tensor.device:
-            dense_tensor = dense_tensor.to(selected_cols_matrix.device)
-            
-        result = torch.sparse.mm(selected_cols_matrix, dense_tensor)
-
-        return result
-
-    def forward(self, inputs, concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels, tf_idf_matrix, emb_data=None, cache_output=False):
+    def forward(self, inputs, concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels, emb_data=None, cache_output=False):
         """
         concept_ids: (batch_size, n_node)
         adj_lengths: (batch_size,)
@@ -361,6 +289,7 @@ class LMGNN(PreTrainedModelClass):
             bert_or_roberta = self.bert
         else:
             bert_or_roberta = self.roberta
+            
         # Merged core
         lm_outputs, gnn_output = bert_or_roberta(input_ids, token_type_ids, attention_mask, output_mask, gnn_input, adj, node_type_ids, node_scores, special_nodes_mask, output_hidden_states=True)
         # lm_outputs: ([bs, seq_len, sent_dim], [bs, sent_dim], ([bs, seq_len, sent_dim] for _ in range(25)))
@@ -468,31 +397,6 @@ class LMGNN(PreTrainedModelClass):
             # dense_tensor = torch.randn(297928, 1).cuda()
             start_time = time.time()
             # Iterate over the sublists in concept_list to create individual matrices
-            for sublist, dense_tensor, label in zip(concept_ids, similarity, labels):
-            # for label in labels:
-                # Process each part
-                # streams = [torch.cuda.Stream(device=i) for i in range(len(tf_idf_matrix))]
-                total_results = []
-                for i, torch_part in enumerate(tf_idf_matrix):
-                    # with torch.cuda.stream(streams[i]):
-                        # for torch_part in device_parts:
-                            # result = torch.sparse.mm(torch_part, dense_tensor.to(torch_part.device))
-                            sublist_adjusted = sublist.to(torch_part.device)  # Adjust sublist to the correct device
-                            dense_tensor_adjusted = dense_tensor.to(torch_part.device) #.requires_grad_(True)  # Adjust dense_tensor to the correct device
-                            result = self.process_tf_idf_part(torch_part, sublist_adjusted, dense_tensor_adjusted)
-                            total_results.append(result)
-                            
-                    # for stream in streams:
-                    #     stream.synchronize()
-                total_results = [result.to(total_results[-1].device) for result in total_results]
-                # Sum the results from each part
-                summed_results = sum(total_results)
-                # Concatenate results from all parts 
-                top_scores = self.soft_topk(summed_results, k=1000)  # Assume k=1000 for top-k
-                # Append top_scores to the list
-            
-                retrieval_loss = self.retrieval_loss(top_scores, label)
-                all_retrieval_loss.append(retrieval_loss)
 
             summed_retrieval_loss = sum(all_retrieval_loss)
 
@@ -513,7 +417,7 @@ class LMGNN(PreTrainedModelClass):
         else:
             logits = None
 
-        return logits, summed_retrieval_loss, top_scores, lm_loss, (link_loss, pos_link_loss, neg_link_loss)
+        return logits, sent_vecs, lm_loss, (link_loss, pos_link_loss, neg_link_loss)
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):

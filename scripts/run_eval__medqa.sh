@@ -1,13 +1,14 @@
 #!/bin/bash
 
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=2
+export DEVICE_TO_USE="2"
 export TOKENIZERS_PARALLELISM=true
 export OMP_NUM_THREADS=4
 export INHERIT_BERT=1
 dt=`date '+%Y%m%d_%H%M%S'`
 
 
-dataset="medqa"
+dataset="pubmedqa"
 shift
 encoder='michiyasunaga/BioLinkBERT-large'
 load_model_path=models/biomed_model.pt
@@ -25,7 +26,7 @@ gnndim=200
 
 
 encoder_layer=-1
-max_node_num=200
+max_node_num=400
 seed=5
 lr_schedule=warmup_linear
 warmup_steps=500
@@ -60,11 +61,11 @@ echo "******************************"
 save_dir_pref='runs'
 mkdir -p $save_dir_pref
 
-run_name=dragon__${dataset}_ih_${inhouse}_load__elr${elr}_dlr${dlr}_b${bs}_ufz${unfreeze_epoch}_e${n_epochs}_sd${seed}__${dt}
+run_name=drums__${dataset}_ih_${inhouse}_load__elr${elr}_dlr${dlr}_b${bs}_ufz${unfreeze_epoch}_e${n_epochs}_sd${seed}__${dt}
 
 
 ###### Training ######
-python3 -u dragon.py --mode eval \
+python3 -u drums.py --mode eval \
     --dataset $dataset \
     --encoder $encoder -k $k --gnn_dim $gnndim -elr $elr -dlr $dlr -bs $bs --seed $seed -mbs ${mbs} --unfreeze_epoch ${unfreeze_epoch} --encoder_layer=${encoder_layer} -sl ${max_seq_len} --max_node_num ${max_node_num} \
     --n_epochs $n_epochs --max_epochs_before_stop ${max_epochs_before_stop} --fp16 $fp16 --upcast $upcast --use_wandb false \

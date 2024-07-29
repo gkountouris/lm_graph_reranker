@@ -7,6 +7,7 @@ import time
 import types
 
 import torch
+import sys
 
 
 def bool_flag(v):
@@ -157,3 +158,70 @@ def sort_dict(d):
 def sort_and_normalize_dict(d):
     s = sum(d.values())
     return {k: v / s for k, v in sorted(d.items(), key=lambda item: item[1], reverse=True)}
+
+def tensor_memory_size(tensor):
+    """
+    Calculate the memory size occupied by a tensor.
+    """
+    # Get number of elements in tensor
+    num_elements = tensor.numel()
+    
+    # Get size of each element in bytes
+    element_size = tensor.element_size()
+    
+    # Total memory in bytes
+    total_bytes = num_elements * element_size
+    
+    # Convert bytes to kilobytes (1 KB = 1024 Bytes)
+    total_kilobytes = total_bytes / 1024
+    
+    # Convert kilobytes to megabytes (1 MB = 1024 KB)
+    total_megabytes = total_kilobytes / 1024
+
+    total_gigabytes = total_megabytes / 1024
+    
+    return total_gigabytes
+
+
+def print_memory_info(device):
+    if "cuda" in device.type:
+        total_memory = torch.cuda.get_device_properties(device).total_memory
+        allocated_memory = torch.cuda.memory_allocated(device)
+        free_memory = total_memory - allocated_memory
+        print(f"Device: {device}, Total memory: {total_memory}, Allocated memory: {allocated_memory}, Free memory: {free_memory}", file=sys.stderr)
+    else:
+        print(f"Device: {device}, Memory info not available for CPU", file=sys.stderr)
+
+
+def count_parameters(loaded_params, not_loaded_params):
+    num_params = sum(p.numel() for p in not_loaded_params.values() if p.requires_grad)
+    num_fixed_params = sum(p.numel() for p in not_loaded_params.values() if not p.requires_grad)
+    num_loaded_params = sum(p.numel() for p in loaded_params.values())
+    print('num_trainable_params (out of not_loaded_params):', num_params, file=sys.stderr)
+    print('num_fixed_params (out of not_loaded_params):', num_fixed_params, file=sys.stderr)
+    print('num_loaded_params:', num_loaded_params, file=sys.stderr)
+    print('num_total_params:', num_params + num_fixed_params + num_loaded_params, file=sys.stderr)
+
+
+def split_jsonl(inputfolder, outputfolder, file_path, train_ratio=0.7, dev_ratio=0.15, test_ratio=0.15):
+    # Read the JSONL file
+    with open(inputfolder + file_path, 'r') as file:
+        lines = file.readlines()
+        
+    # Calculate split indices
+    total_lines = len(lines)
+    train_end = int(total_lines * train_ratio)
+    dev_end = train_end + int(total_lines * dev_ratio)
+
+    # Split the data
+    train_data = lines[:train_end]
+    dev_data = lines[train_end:dev_end]
+    test_data = lines[dev_end:]
+    
+    # Save the splits to new JSONL files
+    with open(outputfolder + 'train.grounded.jsonl', 'w') as file:
+        file.writelines(train_data)
+    with open(outputfolder + 'dev.grounded.jsonl', 'w') as file:
+        file.writelines(dev_data)
+    with open(outputfolder + 'test.grounded.jsonl', 'w') as file:
+        file.writelines(test_data)

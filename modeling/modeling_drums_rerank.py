@@ -63,10 +63,9 @@ class DRUMS(nn.Module):
         pos_triples_init: list of (n_examples, ). each entry is [h,r,t] where h/r/t: torch.tensor(n_triple?, ) ==> [3, `total_n_triple`]
         neg_nodes_init:   list of (n_examples, ). each entry is torch.tensor(n_triple?, n_neg) ==> [`total_n_triple`, n_neg]
         """
+
         n_examples = len(edge_index_init)
-        print(n_examples, sys.stderr)
         edge_index = [edge_index_init[_i_] + _i_ * n_nodes for _i_ in range(n_examples)]
-        print(len(edge_index), file=sys.stderr)
         edge_index = torch.cat(edge_index, dim=1) #[2, total_E]
         edge_type = torch.cat(edge_type_init, dim=0) #[total_E, ]
 
@@ -105,19 +104,22 @@ class DRUMS(nn.Module):
         """
         bs, nc = inputs[0].size(0), inputs[0].size(1)
         #Here, merge the batch dimension and the num_choice dimension
-        assert len(inputs) == 6 + 5 + 2 + 2 + 1  #6 lm_data, 5 gnn_data, (edge_index, edge_type), (pos_triples, neg_nodes)
-        edge_index_orig, edge_type_orig = inputs[-2:]
+        assert len(inputs) == 6 + 5 + 2 + 2 + 3 # 18 #6 lm_data, 5 gnn_data, (edge_index, edge_type), (pos_triples, neg_nodes), doc_dense_tensor, doc_pos_labels_tensor, doc_labels_tensor
+        edge_index_orig, edge_type_orig = inputs[13:15]
+        doc_dense_tensor, doc_pos_labels_tensor, doc_labels_tensor = inputs[15:18]
+
         _inputs = [x.reshape(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[:6]] + [x.reshape(x.size(0) * x.size(1), *x.size()[2:]) for x in inputs[6:11]] + [sum(x,[]) for x in inputs[11:15]]
 
-        *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, edge_index, edge_type, pos_triples, neg_nodes, tf_tensors = _inputs
+        *lm_inputs, concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, edge_index, edge_type, pos_triples, neg_nodes = _inputs
+
         # node_scores = torch.zeros_like(node_scores) #handled in LMGNN forward
         edge_index, edge_type, pos_triples, neg_nodes = self.batch_graph(edge_index, edge_type, pos_triples, neg_nodes, concept_ids.size(1))
         device = node_type_ids.device
         adj     = (edge_index.to(device), edge_type.to(device))
         lp_data = (pos_triples.to(device), neg_nodes.to(device))
         
-        logits, top_scores, lm_loss, link_losses = self.lmgnn(lm_inputs, concept_ids,
-                                    node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels,
+        logits, retrieval_loss, num_retrieved, sorted_doc_labels_tensor, lm_loss, link_losses = self.lmgnn(lm_inputs, concept_ids,
+                                    node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels, doc_dense_tensor, doc_pos_labels_tensor, doc_labels_tensor,
                                     emb_data=None, cache_output=cache_output)
         # logits: [bs * nc], lm_loss: scalar, link_losses: (scalar, scalar, scalar)
         if logits is not None:
@@ -125,9 +127,9 @@ class DRUMS(nn.Module):
         lm_loss = lm_loss * bs
         link_losses = [item * bs for item in link_losses]
         if not detail:
-            return logits, top_scores, lm_loss, link_losses
+            return logits, retrieval_loss, num_retrieved, sorted_doc_labels_tensor, lm_loss, link_losses
         else:
-            return logits, top_scores, lm_loss, link_losses, concept_ids.view(bs, nc, -1), node_type_ids.view(bs, nc, -1), edge_index_orig, edge_type_orig
+            return logits, retrieval_loss, num_retrieved, sorted_doc_labels_tensor, lm_loss, link_losses, concept_ids.view(bs, nc, -1), node_type_ids.view(bs, nc, -1), edge_index_orig, edge_type_orig
             # edge_index_orig: list of (batch_size, num_choice). each entry is torch.tensor(2, E)
             # edge_type_orig: list of (batch_size, num_choice). each entry is torch.tensor(E, )
 
@@ -215,11 +217,11 @@ class LMGNN(PreTrainedModelClass):
         self.layer_id = layer_id
         self.cpnet_vocab_size = n_concept
 
-
         if args.retrieval_task:
             self.cls_projection = layers.MLP(concept_in_dim, concept_in_dim, concept_dim, 2, 0.2, layer_norm=True)
             self.gnn_projection = layers.MLP(concept_dim, concept_dim, concept_dim, 2, 0.2, layer_norm=True)
-            # self.retrieval_loss = optimization_utils.SoftRankCrossEntropyLoss()
+            self.documents_projection = layers.MLP(concept_dim, concept_dim, concept_dim, 2, 0.2, layer_norm=True)
+            self.retrieval_loss_func = torch.nn.CrossEntropyLoss()
 
         if args.link_task:
             if args.link_decoder == 'DistMult':
@@ -243,81 +245,8 @@ class LMGNN(PreTrainedModelClass):
         elif isinstance(module, nn.LayerNorm):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
-            
-    def soft_topk(self, x, k, temperature=1.0):
-        gumbel_noise = -torch.log(-torch.log(torch.rand_like(x)))
-        x_with_noise = x + gumbel_noise
-        soft_scores = torch.nn.functional.softmax(x_with_noise / temperature, dim=0)  # Changed dim to 0
 
-        # Get top-k indices based on the soft scores
-        topk_indices = torch.topk(soft_scores, k, dim=0).indices  # Changed dim to 0
-
-        # Create a mask for the top-k elements
-        mask = torch.zeros_like(soft_scores, dtype=torch.bool).scatter_(dim=0, index=topk_indices, src=torch.ones_like(topk_indices, dtype=torch.bool))  # Changed dim to 0
-
-        # Apply the mask to keep only the top-k elements' scores
-        masked_soft_scores = soft_scores * mask
-
-        return masked_soft_scores
-    
-
-    def process_tf_idf_part(self, tf_idf_part, sublist, dense_tensor):
-
-        def slice_sparse_tensor(sparse_tensor, col_indices):
-            indices = sparse_tensor._indices()
-            values = sparse_tensor._values()
-
-            # Create a mask for the columns to select
-            mask = torch.isin(indices[1], col_indices)
-
-            # Apply the mask to select the corresponding values and indices
-            selected_indices = indices[:, mask]
-            selected_values = values[mask]
-
-            # Ensure col_indices is sorted
-            unique_col_indices, _ = torch.sort(col_indices)
-
-            # Use torch.searchsorted to find positions
-            remapped_cols = torch.searchsorted(unique_col_indices, selected_indices[1])
-
-            # Create the new indices tensor with remapped column indices
-            new_indices = torch.stack([selected_indices[0], remapped_cols])
-
-            # The shape should have the same number of rows and the length of col_indices
-            shape = [sparse_tensor.shape[0], len(col_indices)]
-
-            # Create the new sparse tensor
-            selected_tensor = torch.sparse_coo_tensor(new_indices, selected_values, torch.Size(shape)) #, requires_grad=True
-
-            return selected_tensor
-        
-        # Manually slice the sparse tensor
-        selected_cols_matrix = slice_sparse_tensor(tf_idf_part, sublist)
-
-        # Ensure dense_tensor is in the correct format
-        if dense_tensor.dim() == 1:
-            dense_tensor = dense_tensor.unsqueeze(1)  # Convert from [n] to [n, 1]
-
-        if dense_tensor.dim() > 2:  # Assuming you expect a 2D tensor
-            dense_tensor = torch.squeeze(dense_tensor)
-            print(f"New shape of dense tensor: {dense_tensor.shape}")
-            
-        # Convert to torch.float32 if they are not
-        if selected_cols_matrix.dtype != torch.float32:
-            selected_cols_matrix = selected_cols_matrix.to(torch.float32)
-
-        if dense_tensor.dtype != torch.float32:
-            dense_tensor = dense_tensor.to(torch.float32)
-
-        # If not on the same device, move them to the same device (e.g., 'cuda:0')
-        if selected_cols_matrix.device != dense_tensor.device:
-            dense_tensor = dense_tensor.to(selected_cols_matrix.device)
-            
-        result = torch.sparse.mm(selected_cols_matrix, dense_tensor)
-
-        return result
-
-    def forward(self, inputs, concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels, emb_data=None, cache_output=False):
+    def forward(self, inputs, concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, adj, lp_data, labels, doc_dense_tensor, doc_pos_labels_tensor, doc_labels_tensor, emb_data=None, cache_output=False):
         """
         concept_ids: (batch_size, n_node)
         adj_lengths: (batch_size,)
@@ -335,11 +264,19 @@ class LMGNN(PreTrainedModelClass):
         if self.args.mlm_task:
             input_ids = lm_input_ids
         
+
         # GNN inputs
-        concept_ids[concept_ids == 0] = self.cpnet_vocab_size + 2
+        # Efficiently set the first column and prepare `gnn_input`
+        concept_ids[:, 0] = self.cpnet_vocab_size + 2
+        # Create a copy of concept_ids for temporary modification
+        temp_concept_ids = concept_ids.clone()
+
+        # Identify non-zero elements (excluding the first column adjustments)
+        # and subtract 1 only from these elements
+        temp_concept_ids[temp_concept_ids != 0] -= 1
 
         if self.k >= 0:
-            gnn_input = self.concept_emb(concept_ids - 1, emb_data).to(node_type_ids.device)
+            gnn_input = self.concept_emb(temp_concept_ids, emb_data).to(node_type_ids.device)
         else:
             gnn_input = torch.zeros((concept_ids.size(0), concept_ids.size(1), self.concept_dim)).float().to(node_type_ids.device)
         gnn_input[:, 0] = 0
@@ -435,44 +372,57 @@ class LMGNN(PreTrainedModelClass):
         if self.args.retrieval_task:
 
             _bs, max_node_num, gnn_dim = gnn_output.size()
+            num_rerank_labels = 100
 
-            cls_embs = self.cls_projection(sent_vecs)
+            cls_embs = self.cls_projection(sent_vecs.to(doc_dense_tensor.device))
             # Expand the CLS token to match the embeddings' shape
-            cls_token_expanded = cls_embs.unsqueeze(1).expand(-1, max_node_num, -1)
+            cls_token_expanded = cls_embs.unsqueeze(1).expand(-1, num_rerank_labels, -1)
+            # Process GNN output
+            gnn_embs = self.process_gnn_output(gnn_output.to(doc_dense_tensor.device))
 
-            embs = gnn_output.view(-1, gnn_dim) # [`total_n_nodes`, gnn_dim]
-            gnn_embs = self.gnn_projection(embs)
-            gnn_embs = gnn_embs.view(_bs, max_node_num, gnn_dim)
+            embeddings_tensor = torch.bmm(doc_dense_tensor, gnn_embs)
+            # Projection for document embeddings (assuming gnn_doc_embeddings is intended to be embeddings_tensor)
+            gnn_doc_embeddings = self.documents_projection(embeddings_tensor)
+            # Compute cosine similarity
+            similarities = F.cosine_similarity(cls_token_expanded, gnn_doc_embeddings, dim=2)
 
-            concept_ids[concept_ids == self.cpnet_vocab_size + 2] = 0
+            # Sort the similarities and get the indices
+            sorted_similarities, sorted_indices = torch.sort(similarities, descending=True)  # Assuming you want descending order
 
-            # Compute the cosine similarity
-            similarity = F.cosine_similarity(cls_token_expanded, gnn_embs, dim=2)
-            gnn_embs = gnn_embs.to(labels.device)
+            # Use the sorted indices to reorder doc_labels_tensor
+            doc_labels_tensor = doc_labels_tensor.squeeze(-1)
+            sorted_doc_labels_tensor = doc_labels_tensor.gather(1, sorted_indices)
 
-            # Assuming 'similarity' is your 2D tensor
-            min_vals = similarity.min(dim=1, keepdim=True)[0]  # Minimum values for each row
-            max_vals = similarity.max(dim=1, keepdim=True)[0]  # Maximum values for each row
+            # Squeeze doc_pos_labels_tensor to remove the last dimension, making it [batch_size, N]
+            doc_pos_labels_tensor_squeezed = doc_pos_labels_tensor.squeeze(-1)
+            # Find the indices of the true labels (where doc_pos_labels_tensor equals 1) for each batch item
+            true_label_positions = (doc_pos_labels_tensor_squeezed == 1).nonzero(as_tuple=True)[1]
 
-            # Avoid division by zero in case max and min are the same
-            range_vals = max_vals - min_vals
-            range_vals[range_vals == 0] = 1
 
-            # Normalize the tensor to 0-1 range for each row
-            similarity = (similarity - min_vals) / range_vals
+            print("doc_labels_tensor", doc_labels_tensor, file=sys.stderr)
+            print("doc_pos_labels_tensor", doc_pos_labels_tensor, file=sys.stderr)
 
-            similarity[node_type_ids == 3] = 0
-            similarity[node_type_ids == 2] = 0
-            
-            # Initialize a list to store the dense matrices
-            # Iterate over the sublists in concept_list to create individual matrices
+            print("true_label_positions", true_label_positions, file=sys.stderr)
+            print("sorted_doc_labels_tensor", sorted_doc_labels_tensor, file=sys.stderr)
 
-            # Concatenate results from all parts 
-            top_scores = self.soft_topk(results, k=1000)  # Assume k=1000 for top-k
-            # Append top_scores to the list
+            # print("final_scores", final_scores, file=sys.stderr)
+            # print("sorted_final_scores", sorted_final_scores, file=sys.stderr)
+            # print("sorted_indices", sorted_indices, file=sys.stderr)
+            # print("doc_labels_tensor", doc_labels_tensor, file=sys.stderr)
+            # print("labels", labels, file=sys.stderr)
+            # print("binary_mask", binary_mask, file=sys.stderr)
+            # print("sorted_doc_labels_tensor", sorted_doc_labels_tensor, file=sys.stderr)
 
+            # Find the indices of the highest similarities for each item in the batch
+            highest_similarities_indices = torch.argmax(similarities, dim=1)
+            # Check if the highest similarity index matches the true label position for each item in the batch
+            true_label_is_highest = highest_similarities_indices == true_label_positions
+            num_retrieved = true_label_is_highest.sum()
+
+            # Compute the loss
+            retrieval_loss = self.pairwise_ranking_loss(_bs, similarities, true_label_positions, num_rerank_labels=num_rerank_labels, margin=0.1)
         else:
-            top_scores = None
+            retrieval_loss = 0.
 
         # Concatenated pool
         if self.args.end_task:
@@ -488,7 +438,75 @@ class LMGNN(PreTrainedModelClass):
         else:
             logits = None
 
-        return logits, top_scores, lm_loss, (link_loss, pos_link_loss, neg_link_loss)
+        return logits, retrieval_loss, num_retrieved, sorted_doc_labels_tensor, lm_loss, (link_loss, pos_link_loss, neg_link_loss)
+
+    def process_gnn_output(self, gnn_output):
+        _bs, max_node_num, gnn_dim = gnn_output.size()
+        embs = gnn_output.view(-1, gnn_dim)
+        gnn_embs = self.gnn_projection(embs)
+        return gnn_embs.view(_bs, max_node_num, gnn_dim)
+
+    def aggregate_embeddings(self, _bs, doc_dense_tensor, doc_pos_labels_tensor, doc_labels_tensor, concept_ids, labels, gnn_embs, num_rerank_labels):
+        embeddings_tensor = torch.zeros((_bs, num_rerank_labels, gnn_embs.shape[-1]), device=gnn_embs.device)
+        true_label_positions = torch.full((_bs,), -1, dtype=torch.long, device=gnn_embs.device)
+
+        for i, true_label in enumerate(labels):
+            bm25_labels = torch.unique(tf_labels_ids)
+
+            label_embeddings = []
+            for label in bm25_labels:
+                label_indices = (tf_labels_ids == label).nonzero(as_tuple=True)[0]
+                current_concept_ids = tf_concept_ids[label_indices]
+                current_values = tf_values[label_indices]
+
+                # Find positions of current_concept_ids in concept_ids_i
+                positions = torch.hstack([torch.nonzero(concept_ids[i] == id, as_tuple=True)[0] for id in current_concept_ids])
+                relevant_embs = gnn_embs[i, positions]
+
+                # Weight the embeddings if needed
+                weighted_embs = relevant_embs * current_values.unsqueeze(1)
+                summed_embs = torch.sum(weighted_embs, dim=0)
+
+                label_embeddings.append((label.item(), summed_embs))
+
+                # Directly check and store the position of the true label
+                if label == true_label:
+                    true_label_positions[i] = len(label_embeddings) - 1  # Adjust for zero indexing
+
+            # Sort label_embeddings if necessary or directly fill embeddings_tensor
+            # This is a simplified approach; adjust based on your specific needs
+            for j, (_, embedding) in enumerate(label_embeddings):
+                if j >= num_rerank_labels: break
+                embeddings_tensor[i, j, :] = embedding
+
+        return embeddings_tensor, true_label_positions
+    
+    def pairwise_ranking_loss(self, _bs, similarities, true_indices, num_rerank_labels, margin=0.1):
+        """
+        Compute a pairwise ranking loss without averaging inside the function.
+
+        :param similarities: Tensor of shape (batch_size, num_documents) containing similarity scores.
+        :param true_indices: LongTensor of shape (batch_size,) with the indices of the true documents.
+        :param margin: The margin by which true documents should be ranked higher than false ones.
+        :return: A tensor representing the loss for each example in the batch.
+        """
+        
+        true_similarities = similarities[torch.arange(_bs), true_indices]
+
+        # Expand true similarities to compare with all others
+        true_similarities_expanded = true_similarities.unsqueeze(1).expand(-1, num_rerank_labels)
+
+        # Compute the difference plus margin
+        loss_elements = margin - true_similarities_expanded + similarities
+
+        # Apply clamp to zero out negative values, indicating satisfied pairs
+        loss_elements_clamped = torch.clamp(loss_elements, min=0)
+
+        # Zero out the loss for the true label comparisons to itself
+        loss_elements_clamped[torch.arange(_bs), true_indices] = 0
+
+        # Instead of averaging here, return the sum or mean as per batch needs outside this function
+        return loss_elements_clamped.sum(dim=1).sum()  # Sum over documents for each example in the batch
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *model_args, **kwargs):

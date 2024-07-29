@@ -2,10 +2,14 @@ import os
 import sys
 import json
 import torch
+import torch.nn.functional as F
 import random
 import pickle
 import itertools
 import numpy as np
+import h5py
+
+from elastic import elastic_search_query
 
 from tqdm import tqdm
 from typing import Any, Callable, Dict, List, NewType, Optional, Tuple, Union
@@ -17,7 +21,7 @@ try:
     from transformers import AlbertTokenizer
 except:
     pass
-
+from elasticsearch import Elasticsearch
 from utils import utils
 
 
@@ -28,7 +32,6 @@ MODEL_CLASS_TO_NAME = {
     'roberta': list(ROBERTA_PRETRAINED_CONFIG_ARCHIVE_MAP.keys()),
     'lstm': ['lstm'],
 }
-
 try:
     MODEL_CLASS_TO_NAME['albert'] =  list(ALBERT_PRETRAINED_CONFIG_ARCHIVE_MAP.keys())
 except:
@@ -44,29 +47,23 @@ MODEL_NAME_TO_CLASS[model_name] = 'bert'
 model_name = 'michiyasunaga/BioLinkBERT-large'
 MODEL_NAME_TO_CLASS[model_name] = 'bert'
 
-
 GPT_SPECIAL_TOKENS = ['_start_', '_delimiter_', '_classify_']
-
 
 class MultiGPUSparseAdjDataBatchGenerator(object):
     """A data generator that batches the data and moves them to the corresponding devices."""
-    def __init__(self, args, devices, batch_size, indexes, qids, labels,
+    def __init__(self, args, devices, batch_size, indexes, qids, labels, tf_idf_tensors, embeddings, V, bm25_calculations, relevant_ent,
                  tensors0=[], lists0=[], tensors1=[], lists1=[], adj_data=None, tokenizer=None):
-
-        print('BATCH SIZE', batch_size, file=sys.stderr)
-        labels_list = []
-        for s in labels:
-            try:
-                labels_list.append(int(s))
-            except ValueError:
-                # Handle the exception or ignore the value
-                print(f"Cannot convert {s} to an integer.")
 
         self.args = args
         self.batch_size = batch_size
         self.indexes = indexes
         self.qids = qids
-        self.labels = torch.tensor(labels_list, dtype=torch.int64)
+        self.labels = labels
+        self.tf_idf_tensors = tf_idf_tensors
+        self.embeddings = embeddings
+        self.V = V
+        self.bm25_calculations = bm25_calculations
+        self.relevant_ent = relevant_ent
         self.tensors0 = tensors0
         self.lists0 = lists0
         self.tensors1 = tensors1
@@ -74,8 +71,7 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
         self.adj_data = adj_data
         self.tokenizer = tokenizer
         self.devices = devices
-        
-        
+
         self.mlm_probability = args.mlm_probability
         if args.span_mask:
             print ('span_mask', args.span_mask, file=sys.stderr)
@@ -98,7 +94,7 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
             b = min(n, a + bs)
             batch_indexes = self.indexes[a:b]
             batch_qids = [self.qids[idx] for idx in batch_indexes]
-            batch_labels = self._to_device(self.labels[batch_indexes], self.devices[0])
+            batch_labels = [torch.tensor(self.labels[idx]).to(self.devices[0]) for idx in batch_indexes]
 
             batch_tensors0 = [self._to_device(x[batch_indexes], self.devices[1]) for x in self.tensors0]
             assert len(batch_tensors0) == 4 #tensors0: all_input_ids, all_input_mask, all_segment_ids, all_output_mask
@@ -107,25 +103,76 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
             batch_tensors1 = [self._to_device(x[batch_indexes], self.devices[1]) for x in self.tensors1]
             assert len(batch_tensors1) == 5 #tensors1: concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask
             batch_tensors1[0] = batch_tensors1[0].to(self.devices[0])
+
+            # max_size_dense = min(1000, max(self.tf_idf_tensors[qids]['dense_matrix'].to_dense().shape[0] for qids in batch_qids))
+            max_size_dense = 1000
+
+            doc_dense_tensors = [self.pad_tensor_to_target(self.tf_idf_tensors[qids]['dense_matrix'].to_dense(), max_size_dense, self.devices[2]) for qids in batch_qids]
+            # Stack the padded tensors 
+            doc_dense_tensors = torch.stack(doc_dense_tensors)
+
+            bm25_score_tensor = [self.pad_tensor_to_target(self.bm25_calculations[qids]['scores'], max_size_dense, self.devices[0]) for qids in batch_qids]
+            bm25_labels_tensor = [self.pad_tensor_to_target(self.bm25_calculations[qids]['bm_labels'], max_size_dense, 'cpu') for qids in batch_qids]
+            relevant_ent = [self.pad_tensor_to_target(self.relevant_ent[qids]['relevant_ent'], 5000, self.devices[0]) for qids in batch_qids]
+            bm25_score_tensor = torch.stack(bm25_score_tensor)
+            bm25_labels_tensor = torch.stack(bm25_labels_tensor)
+            relevant_ent = torch.stack(relevant_ent)
+            
+            labels = bm25_labels_tensor-1
+            mask = labels >= 0
+            valid_indices = torch.clamp(labels, min=0)
+            
+            # embe = self.embeddings[valid_indices]
+            # embe = embe.to(self.devices[2])  # Make sure embe is on the target GPU device
+            # mask = mask.to(self.devices[2])  # Ensure mask is on the same device as embe
+            # embe = embe * mask.unsqueeze(-1)  # Apply mask, unsqueeze to match embe dimensions if necessary
+
+            embe = self.embeddings
+
+            bm25_labels_tensor = bm25_labels_tensor.to(self.devices[0])
+
             batch_lists0 = [self._to_device([x[i] for i in batch_indexes], self.devices[0]) for x in self.lists0]
             batch_lists1 = [self._to_device([x[i] for i in batch_indexes], self.devices[1]) for x in self.lists1]
 
             edge_index_all, edge_type_all = self.adj_data
             #edge_index_all: nested list of shape (n_samples, num_choice), where each entry is tensor[2, E]
             #edge_type_all:  nested list of shape (n_samples, num_choice), where each entry is tensor[E, ]
-            edge_index = self._to_device([edge_index_all[i] for i in batch_indexes], self.devices[1])
-            edge_type  = self._to_device([edge_type_all[i] for i in batch_indexes], self.devices[1])
+            edge_index = self._to_device([edge_index_all[i] for i in batch_indexes], self.devices[0])
+            edge_type  = self._to_device([edge_type_all[i] for i in batch_indexes], self.devices[0])
             node_type_ids = batch_tensors1[1] #[bs, nc, n_nodes]
             assert node_type_ids.dim() == 3
             edge_index, edge_type, pos_triples, neg_nodes = self.process_graph_data(edge_index, edge_type, node_type_ids)
 
-            yield tuple([batch_qids, batch_labels, batch_lm_inputs, batch_lm_labels, *batch_tensors0, *batch_lists0, *batch_tensors1, *batch_lists1, edge_index, edge_type, pos_triples, neg_nodes])
+            yield tuple([batch_qids, batch_labels, batch_lm_inputs, batch_lm_labels, *batch_tensors0, *batch_lists0, *batch_tensors1, *batch_lists1, edge_index, edge_type, pos_triples, neg_nodes, doc_dense_tensors, bm25_labels_tensor, embe, bm25_score_tensor, self.V, relevant_ent])
 
     def _to_device(self, obj, device):
         if isinstance(obj, (tuple, list)):
             return [self._to_device(item, device) for item in obj]
         else:
             return obj.to(device)
+
+    # Function to pad a tensor to match a target size, modified to accept a device argument
+    def pad_tensor_to_target(self, tensor, target_size, device):
+        current_size = tensor.size(0)
+
+        # If the tensor is larger than the target, slice to keep the last target_size entries
+        if current_size > target_size:
+            # Calculate the start index to slice from, keeping the last target_size entries
+            start_index = current_size - target_size
+            # Slice the tensor. The handling might vary if your tensor has more dimensions.
+            if tensor.dim() == 2:
+                tensor = tensor[start_index:, :]
+            else:
+                tensor = tensor[start_index:]
+        # If the tensor is smaller, pad it to match the target size
+        elif current_size < target_size:
+            pad_size = target_size - current_size  # Calculate padding size for the first dimension
+            # Adjust padding dimensions if tensor has more than one dimension
+            padding = (0, 0, 0, pad_size) if tensor.dim() == 2 else (0, pad_size)  # Update based on your tensor dimensions
+            tensor = F.pad(tensor, padding, "constant", 0)  # Pad at the end of the first dimension
+        elif current_size == target_size:
+            pass
+        return tensor.to(device)
 
     def set_eval_end_task_mode(self, flag: bool):
         self.eval_end_task_mode = flag
@@ -387,7 +434,6 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
         real_mask = torch.zeros((E,)).long() #[E, ]
         real_mask = real_mask.index_fill_(dim=0, index=real_drop_positions, value=1).bool().to(device) #[E, ]
 
-
         assert int(mask.long().sum()) == drop_count
         # print (f'drop_E / total_E = {drop_count} / {E} = {drop_count / E}', ) #E is typically 1000-3000
         input_edge_index = _edge_index[:, ~real_mask]
@@ -408,11 +454,11 @@ class MultiGPUSparseAdjDataBatchGenerator(object):
 
 class DRUMS_DataLoader(object):
 
-    def __init__(self, args, train_statement_path, train_adj_path,
-                 dev_statement_path, dev_adj_path,
-                 test_statement_path, test_adj_path,
+    def __init__(self, args, train_statement_path, train_adj_path, train_tensor_path,
+                 dev_statement_path, dev_adj_path, dev_tensor_path,
+                 test_statement_path, test_adj_path, test_tensor_path,
                  batch_size, eval_batch_size, devices, model_name,
-                 max_node_num=20000, max_seq_length=128,
+                 max_node_num=400, max_seq_length=128,
                  is_inhouse=False, inhouse_train_qids_path=None,
                  subsample=1.0, n_train=-1, debug=False, cxt_node_connects_all=False, kg="umls"):
         super().__init__()
@@ -432,26 +478,30 @@ class DRUMS_DataLoader(object):
         self.model_type = MODEL_NAME_TO_CLASS[model_name]
         self.load_resources(kg)
 
-        # Load training data
-        print ('train_statement_path', train_statement_path)
-        self.train_qids, self.train_labels, self.train_encoder_data, train_concepts_by_sents_list = self.load_input_tensors(train_statement_path, max_seq_length, mode='train')
-
-        num_choice = self.train_encoder_data[0].size(1)
-        self.num_choice = num_choice
-        print ('num_choice', num_choice)
-        *self.train_decoder_data, self.train_adj_data = self.load_sparse_adj_data_with_contextnode(train_adj_path, max_node_num, train_concepts_by_sents_list, mode='train')
-        if not debug:
-            assert all(len(self.train_qids) == len(self.train_adj_data[0]) == len(x) for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
-
-        print("Finish loading training data.")
+        self.num_choice = 1
 
         # Load dev data
         self.dev_qids, self.dev_labels, self.dev_encoder_data, dev_concepts_by_sents_list = self.load_input_tensors(dev_statement_path, max_seq_length)
         *self.dev_decoder_data, self.dev_adj_data = self.load_sparse_adj_data_with_contextnode(dev_adj_path, max_node_num, dev_concepts_by_sents_list)
         if not debug:
             assert all(len(self.dev_qids) == len(self.dev_adj_data[0]) == len(x) for x in [self.dev_labels] + self.dev_encoder_data + self.dev_decoder_data)
+        self.dev_doc_matrix = self.load_sparse_tf_tensor_data_with_contextnode(dev_tensor_path, max_node_num, self.dev_decoder_data[0], self.dev_qids, self.dev_labels)
+        self.dev_bm25_calculations = self.load_bm25_calculations(dev_adj_path, dev_tensor_path)
 
-        print("Finish loading dev data.")
+        path = './data/mixed/graph/mixed_dev.entities.json'
+        self.dev_relevant_entities = self.load_relevant_entities(path, self.dev_decoder_data[0])
+        print("Finish loading dev data.", file=sys.stderr)
+
+        self.train_qids, self.train_labels, self.train_encoder_data, train_concepts_by_sents_list = self.load_input_tensors(train_statement_path, max_seq_length, mode='train')
+        *self.train_decoder_data, self.train_adj_data = self.load_sparse_adj_data_with_contextnode(train_adj_path, max_node_num, train_concepts_by_sents_list, mode='train')
+        if not debug:
+            assert all(len(self.train_qids) == len(self.train_adj_data[0]) == len(x) for x in [self.train_labels] + self.train_encoder_data + self.train_decoder_data)
+        self.train_doc_matrix = self.load_sparse_tf_tensor_data_with_contextnode(train_tensor_path, max_node_num, self.train_decoder_data[0], self.train_qids, self.train_labels)
+        self.train_bm25_calculations = self.load_bm25_calculations(train_adj_path, train_tensor_path)
+
+        path = './data/mixed/graph/mixed.entities.json'
+        self.train_relevant_entities = self.load_relevant_entities(path, self.train_decoder_data[0])
+        print("Finish loading training data.", file=sys.stderr)
 
         # Load test data
         if test_statement_path is not None:
@@ -459,8 +509,23 @@ class DRUMS_DataLoader(object):
             *self.test_decoder_data, self.test_adj_data = self.load_sparse_adj_data_with_contextnode(test_adj_path, max_node_num, test_concepts_by_sents_list)
             if not debug:
                 assert all(len(self.test_qids) == len(self.test_adj_data[0]) == len(x) for x in [self.test_labels] + self.test_encoder_data + self.test_decoder_data)
+            self.test_doc_matrix = self.load_sparse_tf_tensor_data_with_contextnode(test_tensor_path, max_node_num, self.test_decoder_data[0], self.test_qids, self.test_labels)
+            self.test_bm25_calculations = self.load_bm25_calculations(test_adj_path, test_tensor_path)
 
+            path = './data/mixed/graph/mixed_dev.entities.json'
+            self.test_relevant_entities = self.load_relevant_entities(path, self.test_decoder_data[0])
             print("Finish loading test data.")
+
+        self.V = torch.load('data/pca/V_tensor.pt')
+
+        # hdf5_path = 'data/pubmed_processed/hdf5/pubmed_embeddings.hdf5'
+        # with h5py.File(hdf5_path, 'r') as f:
+        #     # Load the embeddings dataset
+        #     self.embeddings = torch.tensor(f['embeddings'][:], dtype=torch.float32)
+        #     # self.embeddings = f['embeddings'][:]
+        #     print("Finish loading document embeddings.", file=sys.stderr)
+        max_size_dense = 1000
+        self.embeddings = torch.empty(self.batch_size, max_size_dense)
 
         # If using inhouse split, we split the original training set into an inhouse training set and an inhouse test set.
         if self.is_inhouse:
@@ -512,17 +577,17 @@ class DRUMS_DataLoader(object):
 
         print ('local_rank', local_rank, 'len(train_indexes)', len(train_indexes), 'train_indexes[:10]', train_indexes[:10].tolist())
         print ('local_rank', local_rank, 'len(train_indexes)', len(train_indexes), 'train_indexes[:10]', train_indexes[:10].tolist(), file=sys.stderr)
-        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.batch_size, train_indexes, self.train_qids, self.train_labels, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
-
+        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.batch_size, train_indexes, self.train_qids, self.train_labels, self.train_doc_matrix, self.embeddings, self.V, self.train_bm25_calculations, self.train_relevant_entities, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
+                
     def train_eval(self):
-        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, torch.arange(len(self.train_qids)), self.train_qids, self.train_labels, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
+        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.batch_size, train_indexes, self.train_qids, self.train_labels, self.train_doc_matrix, self.embeddings, self.V, self.train_bm25_calculations, self.train_relevant_entities, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
 
     def dev(self):
         if self.debug:
             dev_indexes = torch.arange(self.debug_sample_size)
         else:
             dev_indexes = torch.arange(len(self.dev_qids))
-        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, dev_indexes, self.dev_qids, self.dev_labels, tensors0=self.dev_encoder_data, tensors1=self.dev_decoder_data, adj_data=self.dev_adj_data, tokenizer=self.tokenizer)
+        return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, dev_indexes, self.dev_qids, self.dev_labels, self.dev_doc_matrix, self.embeddings, self.V, self.dev_bm25_calculations, self.dev_relevant_entities, tensors0=self.dev_encoder_data, tensors1=self.dev_decoder_data, adj_data=self.dev_adj_data, tokenizer=self.tokenizer)
 
     def test(self):
         if self.debug:
@@ -532,9 +597,9 @@ class DRUMS_DataLoader(object):
         else:
             test_indexes = torch.arange(len(self.test_qids))
         if self.is_inhouse:
-            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.train_qids, self.train_labels, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
+            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.train_qids, self.train_labels, self.train_doc_matrix, self.embeddings, self.V, self.train_bm25_calculations, self.train_relevant_entities, tensors0=self.train_encoder_data, tensors1=self.train_decoder_data, adj_data=self.train_adj_data, tokenizer=self.tokenizer)
         else:
-            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.test_qids, self.test_labels, tensors0=self.test_encoder_data, tensors1=self.test_decoder_data, adj_data=self.test_adj_data, tokenizer=self.tokenizer)
+            return MultiGPUSparseAdjDataBatchGenerator(self.args, self.devices, self.eval_batch_size, test_indexes, self.test_qids, self.test_labels, self.test_doc_matrix, self.embeddings, self.V, self.test_bm25_calculations, self.test_relevant_entities, tensors0=self.test_encoder_data, tensors1=self.test_decoder_data, adj_data=self.test_adj_data, tokenizer=self.tokenizer)
 
     def load_resources(self, kg):
         # Load the tokenizer
@@ -545,7 +610,36 @@ class DRUMS_DataLoader(object):
         tokenizer = tokenizer_class.from_pretrained(self.model_name)
         self.tokenizer = tokenizer
 
-        if kg == "umls":
+        if kg == "cpnet":
+            # Load cpnet
+            cpnet_vocab_path = self.args.kg_vocab_path #"data/cpnet/concept.txt"
+            with open(cpnet_vocab_path, "r", encoding="utf8") as fin:
+                self.id2concept = [w.strip() for w in fin]
+            self.concept2id = {w: i for i, w in enumerate(self.id2concept)}
+            self.id2relation = conceptnet.merged_relations
+        elif kg == "ddb":
+            cpnet_vocab_path = self.args.kg_vocab_path #"data/ddb/vocab.txt"
+            with open(cpnet_vocab_path, "r", encoding="utf8") as fin:
+                self.id2concept = [w.strip() for w in fin]
+            self.concept2id = {w: i for i, w in enumerate(self.id2concept)}
+            self.id2relation = [
+                'belongstothecategoryof',
+                'isacategory',
+                'maycause',
+                'isasubtypeof',
+                'isariskfactorof',
+                'isassociatedwith',
+                'maycontraindicate',
+                'interactswith',
+                'belongstothedrugfamilyof',
+                'child-parent',
+                'isavectorfor',
+                'mabeallelicwith',
+                'seealso',
+                'isaningradientof',
+                'mabeindicatedby'
+            ]
+        elif kg == "umls":
             cpnet_vocab_path = self.args.kg_vocab_path #"data/umls/concepts.txt"
             with open(cpnet_vocab_path, "r", encoding="utf8") as fin:
                 self.id2concept = [w.strip() for w in fin]
@@ -557,8 +651,8 @@ class DRUMS_DataLoader(object):
     def load_input_tensors(self, input_jsonl_path, max_seq_length, mode='eval'):
         """Construct input tensors for the LM component of the model."""
         cache_path = input_jsonl_path + "-sl{}".format(max_seq_length) + (("-" + self.model_type) if self.model_type != "roberta" else "") + '.loaded_cache'
-        use_cache = False
-
+        use_cache = True
+            
         if use_cache and not os.path.exists(cache_path):
             use_cache = False
             
@@ -599,7 +693,7 @@ class DRUMS_DataLoader(object):
                         for _i_, obj in enumerate(tqdm(input_tensors)):
                             pickle.dump({f'obj{_i_}': obj}, f, protocol=4)
                     print ('saved cache.', file=sys.stderr)
-                    
+
         if mode == 'train' and self.args.local_rank != -1:
             example_ids, all_label, data_tensors, concepts_by_sents_list = input_tensors #concepts_by_sents_list is always []
             assert len(example_ids) == len(all_label) == len(data_tensors[0])
@@ -623,9 +717,211 @@ class DRUMS_DataLoader(object):
         print ('local_rank', self.args.local_rank, 'len(example_ids)', len(example_ids), file=sys.stderr)
         return input_tensors
 
+    def load_sparse_tf_tensor_data_with_contextnode(self, input_jsonl_path, max_seq_length, concept_ids, q_ids, mode='eval'):
+
+        def tensor_memory_in_bytes(tensor):
+            return tensor.element_size() * tensor.nelement()
+        """Construct input tensors for the LM component of the model."""
+        cache_path = input_jsonl_path + "-sl{}".format(max_seq_length) + (("-" + self.model_type) if self.model_type != "roberta" else "") + '.loaded_cache'
+        use_cache = True
+
+        if use_cache and not os.path.exists(cache_path):
+            use_cache = False
+            
+        if use_cache:
+            print (f'Loading cache {cache_path}')
+            print (f'Loading cache {cache_path}', file=sys.stderr)
+            dense_tensors_dict = {}
+            with open(cache_path, 'rb') as in_file:
+                try:
+                    dense_tensors_dict = pickle.load(in_file)
+                except EOFError:
+                    pass
+            print (f'Loaded cache {cache_path}', file=sys.stderr)
+        else:
+            tf_idf_tensors = torch.load(input_jsonl_path)
+            
+            dense_tensors_dict = {}  # Initialize an empty dictionary            
+
+            for _idx, ids in tqdm(enumerate(q_ids), total=len(q_ids), desc='loading tf tensor matrices'):
+                _indices, _values = tf_idf_tensors[ids]
+                
+                # Get the unique labels and concepts for indexing
+                unique_labels, label_indices = torch.unique(_indices[0], return_inverse=True)
+
+                # Flatten concept_ids[_idx].unsqueeze(1) for easier index search
+                flat_concepts = concept_ids[_idx].unsqueeze(1).flatten()
+                # Initialize a new tensor for the adjusted values of tensor2
+                new_concept_indices = torch.zeros_like(_indices[1])
+
+                # Iterate over each value in flat_concepts to find its position in _indices[1]
+                for i, val in enumerate(flat_concepts):
+                    # Find the index of the occurrence of val in _indices[1]
+                    matched_indices = (_indices[1] == val).nonzero(as_tuple=True)[0]
+                    if matched_indices.numel() > 0:
+                        for ind in matched_indices:
+                            # If found, use the first occurrence
+                            new_concept_indices[ind] = i
+                    else:
+                        pass
+
+                # Assuming the shape is based on the max indices plus 1 for each dimension
+                shape = torch.Size([unique_labels.size()[0], max_seq_length])
+
+                updated_indices = torch.stack([label_indices, new_concept_indices])
+
+                sparse_tensor = torch.sparse_coo_tensor(updated_indices, _values, torch.Size(shape))
+
+                # Add the populated dense_matrix to the dictionary with ids as the key
+                dense_tensors_dict[ids] = {'dense_matrix': sparse_tensor}
+
+            if not self.debug:
+                if self.args.local_rank in [-1, 0]:
+                    print('saving cache...', file=sys.stderr)
+                    
+                    # Save the entire dictionary in one go
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(dense_tensors_dict, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    print('saved cache.', file=sys.stderr)
+
+        return dense_tensors_dict
+
+    def load_bm25_calculations(self, adj_path, tensor_path, mode='eval'):
+
+        adj_path = adj_path.replace('.pk', '.json')
+        """Construct input tensors for the LM component of the model."""
+        cache_path = adj_path + "-bm25_predictions" + (("-" + self.model_type) if self.model_type != "roberta" else "") + '.loaded_cache'
+        use_cache = True
+
+        if use_cache and not os.path.exists(cache_path):
+            use_cache = False
+
+        if use_cache:
+            print (f'Loading cache {cache_path}')
+            print (f'Loading cache {cache_path}', file=sys.stderr)
+            q_ids_bm25_scores = {}
+            with open(cache_path, 'rb') as in_file:
+                try:
+                    q_ids_bm25_scores = pickle.load(in_file)
+                except EOFError:
+                    pass
+            print (f'Loaded cache {cache_path}', file=sys.stderr)
+        else:
+
+            tf_idf_tensors = torch.load(tensor_path)
+            q_ids_bm25_scores = {}  # Initialize an empty dictionary
+
+            with open(adj_path, "r") as in_file:
+                try:
+                    adj_concept_pairs = json.load(in_file)
+                except EOFError:
+                    pass
+            for data in adj_concept_pairs:
+
+                _indices, _values = tf_idf_tensors[data['data_id']]
+                
+                # Get the unique labels and concepts for indexing
+                unique_labels, label_indices = torch.unique(_indices[0], return_inverse=True)
+
+                bm_labels = torch.tensor(data['bm_labels'], dtype=torch.long)
+                bm_scores = torch.tensor(data['scores'], dtype=torch.float)
+
+                # Prepare tensors to track found and not found elements and their order
+                indices_in_unique = torch.full(bm_labels.shape, -1, dtype=torch.long)  # Fill with -1 to indicate not found by default
+                for i, label in enumerate(bm_labels):
+                    index = (unique_labels == label).nonzero(as_tuple=True)[0]
+                    if index.numel() > 0:
+                        indices_in_unique[i] = index.item()
+
+                # Identify elements found in both bm_labels and unique_labels
+                found_mask = indices_in_unique >= 0
+
+                # Sort the found elements according to their order in unique_labels
+                sorted_indices = torch.argsort(indices_in_unique[found_mask])
+                sorted_bm_labels_found = bm_labels[found_mask][sorted_indices]
+                sorted_bm_scores_found = bm_scores[found_mask][sorted_indices]
+
+                # Elements only in bm_labels and not in unique_labels
+                bm_labels_not_found = bm_labels[~found_mask]
+                bm_scores_not_found = bm_scores[~found_mask]
+
+                # Concatenate the sorted found elements with the not found elements
+                sorted_bm_labels = torch.cat((sorted_bm_labels_found, bm_labels_not_found))
+                sorted_bm_scores = torch.cat((sorted_bm_scores_found, bm_scores_not_found))
+
+                q_ids_bm25_scores[data['data_id']] = {'bm_labels': sorted_bm_labels, 'scores': sorted_bm_scores}
+
+            if not self.debug:
+                if self.args.local_rank in [-1, 0]:
+                    print('saving cache...', file=sys.stderr)
+                    
+                    # Save the entire dictionary in one go
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(q_ids_bm25_scores, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    print('saved cache.', file=sys.stderr)
+
+        return q_ids_bm25_scores
+
+    def load_relevant_entities(self, adj_path, all_concepts, mode='eval'):
+
+        """Construct input tensors for the LM component of the model."""
+        cache_path = adj_path + "-relevant_entities" + (("-" + self.model_type) if self.model_type != "roberta" else "") + '.loaded_cache'
+        use_cache = True
+
+        if use_cache and not os.path.exists(cache_path):
+            use_cache = False
+
+        if use_cache:
+            print (f'Loading cache {cache_path}')
+            print (f'Loading cache {cache_path}', file=sys.stderr)
+            relevant_ent = {}
+            with open(cache_path, 'rb') as in_file:
+                try:
+                    relevant_ent = pickle.load(in_file)
+                except EOFError:
+                    pass
+            print (f'Loaded cache {cache_path}', file=sys.stderr)
+        else:
+
+            relevant_ent = {}  # Initialize an empty dictionary
+            with open(adj_path, "r") as in_file:
+                try:
+                    adj_concept_pairs = json.load(in_file)
+                except EOFError:
+                    pass
+            for i, data in enumerate(adj_concept_pairs):
+
+                relevant = torch.tensor(data['relevant'], dtype=torch.long) + 1
+                all_concepts = all_concepts.squeeze()
+                concepts = all_concepts[i]
+
+                # Create a zero tensor of the same size as the concepts tensor
+                binary_tensor = torch.zeros(concepts.size(0), dtype=torch.int32)
+
+                # Iterate over the relevant concepts and set the corresponding positions in the binary tensor to 1
+                for concept in relevant:
+                    if concept in concepts:
+                        binary_tensor[concepts == concept] = 1
+
+                # Calculate the sum of the binary tensor
+                binary_sum = torch.sum(binary_tensor)
+
+                relevant_ent[data['data_id']] = {'relevant_ent': binary_tensor}
+
+            if not self.debug:
+                if self.args.local_rank in [-1, 0]:
+                    print('saving cache...', file=sys.stderr)
+                    
+                    # Save the entire dictionary in one go
+                    with open(cache_path, 'wb') as f:
+                        pickle.dump(relevant_ent, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    print('saved cache.', file=sys.stderr)
+
+        return relevant_ent
+
     def load_sparse_adj_data_with_contextnode(self, adj_pk_path, max_node_num, concepts_by_sents_list, mode='eval'):
         """Construct input tensors for the GNN component of the model."""
-        print("Loading sparse adj data...", file=sys.stderr)
+        print("Loading sparse adj data...")
         cache_path = adj_pk_path + "-nodenum{}".format(max_node_num) + ("-cntsall" if self.cxt_node_connects_all else "") + '.loaded_cache'
         # use_cache = self.args.dump_graph_cache
         use_cache = self.args.load_graph_cache
@@ -636,7 +932,8 @@ class DRUMS_DataLoader(object):
         if use_cache:
             print (f'Loading cache {cache_path}')
             print (f'Loading cache {cache_path}', file=sys.stderr)
-            
+            # with open(cache_path, 'rb') as f:
+            #     adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel, special_nodes_mask = utils.CPU_Unpickler(f).load()
             loaded_data = []
             with open(cache_path, "rb") as in_file:
                 try:
@@ -652,7 +949,6 @@ class DRUMS_DataLoader(object):
                             raise TypeError("Invalid type for obj.")
                 except EOFError:
                     pass
-
             adj_lengths_ori, concept_ids, node_type_ids, node_scores, adj_lengths, edge_index, edge_type, half_n_rel, special_nodes_mask = loaded_data
             self.final_num_relation = half_n_rel
             print (f'Loaded cache {cache_path}', file=sys.stderr)
@@ -697,8 +993,9 @@ class DRUMS_DataLoader(object):
         else:
             # Set special nodes and links
             context_node = 0
-            n_special_nodes = 1
+            n_special_nodes = 1  #################################### ΝΟ Special nodes
             cxt2qlinked_rel = 0
+            cxt2alinked_rel = 1
             half_n_rel = len(self.id2relation) + 2
             if self.cxt_node_connects_all:
                 cxt2other_rel = half_n_rel
@@ -715,7 +1012,8 @@ class DRUMS_DataLoader(object):
                         elif type(ex) == tuple:
                             adj_concept_pairs.append(ex)
                         elif type(ex) == list:
-                            assert len(ex) > 2
+                            print(len(ex), file=sys.stderr)
+                            assert len(ex) > 10
                             adj_concept_pairs.extend(ex)
                         else:
                             raise TypeError("Invalid type for ex.")
@@ -758,28 +1056,32 @@ class DRUMS_DataLoader(object):
                 idx += 1
 
                 if isinstance(_data, dict):
-                    adj, concepts, qm, cid2score = _data['adj'], _data['concepts'], _data['qmask'], _data['cid2score']
+                    adj, concepts, qm, am, cid2score = _data['adj'], _data['concepts'], _data['qmask'], _data['amask'], _data['cid2score'], _data['']
                 else:
-                    adj, concepts, qm = _data
+                    adj, concepts, qm, am = _data
                     cid2score = None
-                        
                 #adj: e.g. <4233x249 (n_nodes*half_n_rels x n_nodes) sparse matrix of type '<class 'numpy.bool'>' with 2905 stored elements in COOrdinate format>
                 #concepts: np.array(num_nodes, ), where entry is concept id
                 #qm: np.array(num_nodes, ), where entry is True/False
-
+                #am: np.array(num_nodes, ), where entry is True/False
                 assert len(concepts) == len(set(concepts))
-                # qm[0] = True
-                
+                qam = qm | am
+                #sanity check: should be T,..,T,F,F,..F
+                if len(concepts) == 0:
+                    # print ("KG with 0 node", file=sys.stderr)
+                    pass
+                else:
+                    assert qam[0] == True
                 F_start = False
-                for TF in qm:
+                for TF in qam:
                     if TF == False:
                         F_start = True
                     else:
                         assert F_start == False
-                        
+
                 assert n_special_nodes <= max_node_num
                 special_nodes_mask[idx, :n_special_nodes] = 1
-                
+
                 actual_max_node_num = max_node_num
                 num_concept = min(len(concepts) + n_special_nodes, actual_max_node_num) #this is the final number of nodes including contextnode but excluding PAD
                 adj_lengths_ori[idx] = len(concepts)
@@ -802,7 +1104,7 @@ class DRUMS_DataLoader(object):
                 node_type_ids[idx, 0] = 3 # context node
                 node_type_ids[idx, 1:n_special_nodes] = 4 # sent nodes
                 node_type_ids[idx, n_special_nodes:num_concept][torch.tensor(qm, dtype=torch.bool)[:num_concept - n_special_nodes]] = 0
-                node_type_ids[idx, len(concepts) + 1:] = 1
+                node_type_ids[idx, n_special_nodes:num_concept][torch.tensor(am, dtype=torch.bool)[:num_concept - n_special_nodes]] = 1
 
                 #Load adj
                 ij = torch.tensor(adj.row, dtype=torch.int64) #(num_matrix_entries, ), where each entry is coordinate
@@ -825,6 +1127,18 @@ class DRUMS_DataLoader(object):
                         extra_i.append(cxt2qlinked_rel) #rel from contextnode to question concept
                         extra_j.append(0) #contextnode coordinate
                         extra_k.append(_new_coord) #question concept coordinate
+                    elif self.cxt_node_connects_all:
+                        extra_i.append(cxt2other_rel) #rel from contextnode to other concept
+                        extra_j.append(0) #contextnode coordinate
+                        extra_k.append(_new_coord) #other concept coordinate
+                for _coord, a_tf in enumerate(am):
+                    _new_coord = _coord + n_special_nodes
+                    if _new_coord > num_concept:
+                        break
+                    if a_tf:
+                        extra_i.append(cxt2alinked_rel) #rel from contextnode to answer concept
+                        extra_j.append(0) #contextnode coordinate
+                        extra_k.append(_new_coord) #answer concept coordinate
                     elif self.cxt_node_connects_all:
                         extra_i.append(cxt2other_rel) #rel from contextnode to other concept
                         extra_j.append(0) #contextnode coordinate
@@ -879,8 +1193,83 @@ class DRUMS_DataLoader(object):
             #node_type_ids: (n_questions, num_choice, max_node_num)
             #node_scores: (n_questions, num_choice, max_node_num)
             #adj_lengths: (n_questions,　num_choice)
-            
         return concept_ids, node_type_ids, node_scores, adj_lengths, special_nodes_mask, (edge_index, edge_type) #, half_n_rel * 2 + 1
+
+
+######################### GPT loader utils #########################
+def load_gpt_input_tensors(statement_jsonl_path, max_seq_length):
+    def _truncate_seq_pair(tokens_a, tokens_b, max_length):
+        """Truncates a sequence pair in place to the maximum length."""
+        while True:
+            total_length = len(tokens_a) + len(tokens_b)
+            if total_length <= max_length:
+                break
+            if len(tokens_a) > len(tokens_b):
+                tokens_a.pop()
+            else:
+                tokens_b.pop()
+
+    def load_qa_dataset(dataset_path):
+        """ Output a list of tuples(story, 1st continuation, 2nd continuation, label) """
+        with open(dataset_path, "r", encoding="utf-8") as fin:
+            output = []
+            for line in fin:
+                input_json = json.loads(line)
+                label = ord(input_json.get("answerKey", "A")) - ord("A")
+                output.append((input_json['id'], input_json["question"]["stem"], *[ending["text"] for ending in input_json["question"]["choices"]], label))
+        return output
+
+    def pre_process_datasets(encoded_datasets, num_choices, max_seq_length, start_token, delimiter_token, clf_token):
+        """ Pre-process datasets containing lists of tuples(story, 1st continuation, 2nd continuation, label)
+
+            To Transformer inputs of shape (n_batch, n_alternative, length) comprising for each batch, continuation:
+            input_ids[batch, alternative, :] = [start_token] + story[:cap_length] + [delimiter_token] + cont1[:cap_length] + [clf_token]
+        """
+        tensor_datasets = []
+        for dataset in encoded_datasets:
+            n_batch = len(dataset)
+            input_ids = np.zeros((n_batch, num_choices, max_seq_length), dtype=np.int64)
+            mc_token_ids = np.zeros((n_batch, num_choices), dtype=np.int64)
+            lm_labels = np.full((n_batch, num_choices, max_seq_length), fill_value=-1, dtype=np.int64)
+            mc_labels = np.zeros((n_batch,), dtype=np.int64)
+            for i, data, in enumerate(dataset):
+                q, mc_label = data[0], data[-1]
+                choices = data[1:-1]
+                for j in range(len(choices)):
+                    _truncate_seq_pair(q, choices[j], max_seq_length - 3)
+                    qa = [start_token] + q + [delimiter_token] + choices[j] + [clf_token]
+                    input_ids[i, j, :len(qa)] = qa
+                    mc_token_ids[i, j] = len(qa) - 1
+                    lm_labels[i, j, :len(qa) - 1] = qa[1:]
+                mc_labels[i] = mc_label
+            all_inputs = (input_ids, mc_token_ids, lm_labels, mc_labels)
+            tensor_datasets.append(tuple(torch.tensor(t) for t in all_inputs))
+        return tensor_datasets
+
+    def tokenize_and_encode(tokenizer, obj):
+        """ Tokenize and encode a nested object """
+        if isinstance(obj, str):
+            return tokenizer.convert_tokens_to_ids(tokenizer.tokenize(obj))
+        elif isinstance(obj, int):
+            return obj
+        else:
+            return list(tokenize_and_encode(tokenizer, o) for o in obj)
+
+    tokenizer = OpenAIGPTTokenizer.from_pretrained('openai-gpt')
+    tokenizer.add_tokens(GPT_SPECIAL_TOKENS)
+    special_tokens_ids = tokenizer.convert_tokens_to_ids(GPT_SPECIAL_TOKENS)
+
+    dataset = load_qa_dataset(statement_jsonl_path)
+    examples_ids = [data[0] for data in dataset]
+    dataset = [data[1:] for data in dataset]  # discard example ids
+    num_choices = len(dataset[0]) - 2
+
+    encoded_dataset = tokenize_and_encode(tokenizer, dataset)
+
+    (input_ids, mc_token_ids, lm_labels, mc_labels), = pre_process_datasets([encoded_dataset], num_choices, max_seq_length, *special_tokens_ids)
+    return examples_ids, mc_labels, input_ids, mc_token_ids, lm_labels
+
+
 
 
 ######################### BERT/XLNet/Roberta loader utils #########################
@@ -906,7 +1295,6 @@ class InputFeatures(object):
         ]
         self.label = label
 
-
 def read_query_examples(input_file):
     with open(input_file, "r", encoding="utf-8") as f:
         examples = []
@@ -929,7 +1317,6 @@ def pad_or_truncate(sequence, max_length):
         return sequence + [0] * (max_length - len(sequence))  # Pad
     return sequence
 
-
 def simple_convert_query_examples_to_features(examples, max_seq_length, tokenizer, debug=False):
     """ Loads a data file into a list of `InputBatch`s
         `cls_token_at_end` define the location of the CLS token:
@@ -937,13 +1324,10 @@ def simple_convert_query_examples_to_features(examples, max_seq_length, tokenize
             - True (XLNet/GPT pattern): A + [SEP] + B + [SEP] + [CLS]
         `cls_token_segment_id` define the segment id associated to the CLS token (0 for BERT, 2 for XLNet)
     """
-    
+
     features = []
     concepts_by_sents_list = []
-    debug_sample_size = 10
     for ex_index, example in tqdm(enumerate(examples), total=len(examples), desc="Converting examples to features"):
-        if debug and ex_index >= debug_sample_size:
-            break
         choices_features = []
 
         question = example.question
@@ -961,11 +1345,14 @@ def simple_convert_query_examples_to_features(examples, max_seq_length, tokenize
         assert len(segment_ids) == max_seq_length
 
         choices_features.append((input_ids, input_mask, segment_ids, output_mask))
-        label = example.label
-        features.append(InputFeatures(example_id=example.example_id, choices_features=choices_features, label=label))
+
+        labels = []
+        for label in example.label:
+            labels.append(int(label))
+
+        features.append(InputFeatures(example_id=example.example_id, choices_features=choices_features, label=labels))
 
     return features, concepts_by_sents_list
-
 
 def load_bert_query_input_tensors(statement_jsonl_path, max_seq_length, debug, tokenizer, debug_sample_size):
     def select_field(features, field):
@@ -977,26 +1364,12 @@ def load_bert_query_input_tensors(statement_jsonl_path, max_seq_length, debug, t
         all_segment_ids = torch.tensor(select_field(features, 'segment_ids'), dtype=torch.long)
         all_output_mask = torch.tensor(select_field(features, 'output_mask'), dtype=torch.bool)
         all_label = [f.label for f in features]
+        # all_label = torch.tensor([f.label for f in features], dtype=torch.long)
         return all_input_ids, all_input_mask, all_segment_ids, all_output_mask, all_label
 
     examples = read_query_examples(statement_jsonl_path)
 
-    num_workers = 1
-    if num_workers <= 1:
-        features, concepts_by_sents_list = simple_convert_query_examples_to_features(examples, max_seq_length, tokenizer, debug)
-    else:
-        from copy import deepcopy
-        from multiprocessing import Pool
-        c_size = len(examples)//num_workers +1
-        examples_list   = [examples[i*c_size: (i+1)*c_size]      for i in range(num_workers)]
-        max_seq_length_list = [max_seq_length      for i in range(num_workers)]
-        tokenizer_list      = [deepcopy(tokenizer) for i in range(num_workers)]
-        with Pool(num_workers) as p:
-            ress = list(p.starmap(simple_convert_query_examples_to_features, zip(examples_list, max_seq_length_list, tokenizer_list)))
-        features = []
-        for res in ress:
-            features += res[0]
-            concepts_by_sents_list += res[1]
+    features, concepts_by_sents_list = simple_convert_query_examples_to_features(examples, max_seq_length, tokenizer, debug)
 
     example_ids = [f.example_id for f in features]
     *data_tensors, all_label = convert_features_to_tensors(features)

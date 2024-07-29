@@ -1,4 +1,3 @@
-
 import json
 import matplotlib.pyplot as plt
 from collections import Counter
@@ -38,8 +37,6 @@ def hist_plot(relations):
         # Sort elements by count in descending order and take the top 40
         sorted_elements = sorted(named_elements.items(), key=lambda x: x[1], reverse=True)[10*i:10*(i+1)]
         elements, counts = zip(*sorted_elements)
-
-
 
         # Plot the histogram for top 40 elements
         plt.figure(figsize=(12, 6))

@@ -143,12 +143,13 @@ def concepts_to_adj_matrices_2hop_all_pair__use_glove__Part1(data):
     bm_ids = set()
 
     for idx, res in enumerate(results['hits']['hits']):
-        if idx < 10:
-            for ent in res['_source']['graph_entities']:
-                bm_ids.add(ent)
+        for ent in res['_source']['graph_entities']:
+            bm_ids.add(ent)
 
     bm_ids = set(concept2id[c] for c in bm_ids)
     bm_ids = bm_ids - qc_ids
+
+    print("bm_ids", len(bm_ids))
     qa_nodes = set(qc_ids) | set(bm_ids)
     extra_nodes = set()
     for qid in qa_nodes:
@@ -156,6 +157,7 @@ def concepts_to_adj_matrices_2hop_all_pair__use_glove__Part1(data):
             if qid != aid and qid in cpnet_simple.nodes and aid in cpnet_simple.nodes:
                 extra_nodes |= set(cpnet_simple[qid]) & set(cpnet_simple[aid])
     extra_nodes = extra_nodes - qa_nodes
+    print("extra_nodes", len(extra_nodes))
 
     return (sorted(qc_ids), sorted(bm_ids), question, sorted(extra_nodes))
 
@@ -235,11 +237,11 @@ def generate_adj_data_from_grounded_concepts_umls_retrieval__use_glove(grounded_
     res3 = process_in_batches(concepts_to_adj_matrices_2hop_all_pair__use_glove__Part3, res2, batch_size, num_processes, 'Part3')
 
 
-    # Save results
-    os.system('mkdir -p {}'.format(os.path.dirname(output_path)))
-    with open(output_path, 'wb') as fout:
-        pickle.dump(res3, fout)
+    # # Save results
+    # os.system('mkdir -p {}'.format(os.path.dirname(output_path)))
+    # with open(output_path, 'wb') as fout:
+    #     pickle.dump(res3, fout)
 
-    print(f'adj data saved to {output_path}')
-    print()
+    # print(f'adj data saved to {output_path}')
+    # print()
         

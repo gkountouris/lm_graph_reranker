@@ -97,7 +97,6 @@ def tf_loader(folder):
 
     return torch_tf_idf_parts
 
-
 def scipy_sparse_to_torch_sparse(matrix, device):
     values = matrix.data
     indices = np.vstack((matrix.row, matrix.col))
@@ -107,7 +106,6 @@ def scipy_sparse_to_torch_sparse(matrix, device):
     shape = matrix.shape
 
     return torch.sparse_coo_tensor(i, v, torch.Size(shape), device=device)
-
 
 def slice_sparse_tensor(row_indices, col_indices, sparse_tensor, batch_size=20):
     indices = sparse_tensor._indices()
@@ -127,6 +125,7 @@ def slice_sparse_tensor(row_indices, col_indices, sparse_tensor, batch_size=20):
     # Process col_indices in batches
     for i in range(0, len(col_indices), batch_size):
         batch_col_indices = col_indices[i:i + batch_size]
+        # Convert row_indices to tensor if it is not
         if not isinstance(batch_col_indices, torch.Tensor):
             batch_col_indices = torch.tensor(batch_col_indices, device=indices.device)
 
@@ -153,7 +152,6 @@ def slice_sparse_tensor(row_indices, col_indices, sparse_tensor, batch_size=20):
 
     return selected_tensor
 
-
 def load_resources():
     global concept2id, id2concept, relation2id, id2relation, concept2name
     id2concept = [w.strip() for w in open('data/umls/concepts.txt')]
@@ -164,7 +162,6 @@ def load_resources():
         concept2name[c] = n
     id2relation = [r.strip() for r in open('data/umls/relations.txt')]
     relation2id = {r: i for i, r in enumerate(id2relation)}
-
 
 def load_cpnet(cpnet_graph_path):
     global cpnet, cpnet_simple
@@ -178,7 +175,6 @@ def load_cpnet(cpnet_graph_path):
             cpnet_simple[u][v]['weight'] += w
         else:
             cpnet_simple.add_edge(u, v, weight=w)
-
 
 def concepts2adj(node_ids):
     global id2relation
@@ -251,7 +247,7 @@ def get_glove_score(cids, question):
     return cid2score
 
 def concepts_to_adj_matrices_2hop_all_pair__use_glove__Part1(data):
-    qc_ids, question, ans, id = data
+    qc_ids, question, ans, doc_id = data
     results = elastic_search_query.elastic_search_text(question, 100)
     bm_ids = set()
     bm_lables = []
@@ -275,13 +271,13 @@ def concepts_to_adj_matrices_2hop_all_pair__use_glove__Part1(data):
                 extra_nodes |= set(cpnet_simple[qid]) & set(cpnet_simple[aid])
     extra_nodes = extra_nodes - qa_nodes
 
-    return (sorted(qc_ids), sorted(bm_ids), question, bm_lables, sorted(extra_nodes), id)
+    return (sorted(qc_ids), sorted(bm_ids), question, bm_lables, sorted(extra_nodes), doc_id)
 
 def concepts_to_adj_matrices_2hop_all_pair__use_glove__Part2(data):
     qc_ids, bm_ids, question, bm_lables, extra_nodes, id = data
     cid2score = get_glove_score(qc_ids+bm_ids+extra_nodes, question)
     
-    return (qc_ids, bm_ids, question, bm_lables, extra_nodes, id, cid2score)
+    return (qc_ids, bm_ids, question, bm_lables, extra_nodes, doc_id, cid2score)
 
 def concepts_to_adj_matrices_2hop_all_pair__use_glove__Part3(data):
     qc_ids, bm_ids, question, bm_lables, extra_nodes, id, cid2score = data
@@ -291,7 +287,7 @@ def concepts_to_adj_matrices_2hop_all_pair__use_glove__Part3(data):
     bmask = (arange >= len(qc_ids)) & (arange < (len(qc_ids) + len(bm_ids)))
     adj, concepts = concepts2adj(schema_graph)
     
-    return adj, concepts, qmask, bmask, bm_lables, id
+    return adj, concepts, qmask, bmask, bm_lables, doc_id
 
 
 #####################################################################################################
@@ -327,7 +323,7 @@ def generate_adj_data_from_grounded_concepts_umls_retrieval__use_glove(grounded_
         load_cpnet(cpnet_graph_path)
     
     sparse_tensors = tf_loader("data/pubmed/sparse_matrix.npz")
-
+    
     gc.collect()
     qa_data = []
     ans_dict = {}
@@ -339,7 +335,7 @@ def generate_adj_data_from_grounded_concepts_umls_retrieval__use_glove(grounded_
             obj = json.loads(lines_ground[j])
             QAcontext = "{}".format(obj['sent'])
             ans = "{}".format(obj['ans'])
-            id = "{}".format(obj['id'])
+            doc_id = "{}".format(obj['id'])
             qa_data.append((q_ids, QAcontext, ans, id))
             ans_dict[obj['id']] = obj['ans']
             
@@ -366,8 +362,8 @@ def generate_adj_data_from_grounded_concepts_umls_retrieval__use_glove(grounded_
     row_starts = [sparse_tensors[i]._indices()[0, 0].item() for i in range(3)]
     row_ends = row_starts[1:] + [sparse_tensors[-1].shape[0]]
 
-    for adj, concepts, qmask, bmask, bm_lables, id in tqdm(res3):
-        tensor_dicts[id] = []
+    for adj, concepts, qmask, bmask, bm_lables, doc_id in tqdm(res3):
+        tensor_dicts[doc_id] = []
         res3_adj_data.append((adj, concepts, qmask, bmask))
         cols = [x+1 for x in concepts[:400]]
         try:
@@ -379,17 +375,17 @@ def generate_adj_data_from_grounded_concepts_umls_retrieval__use_glove(grounded_
 
                 if part_bm_labels:
                     sliced_sparse_tensor = slice_sparse_tensor(part_bm_labels, cols, sparse_tensors[part_index], batch_size=20)
-                    tensor_dicts[id].append(sliced_sparse_tensor.to('cpu'))
+                    tensor_dicts[doc_id].append(sliced_sparse_tensor.to('cpu'))
         except:
-            print("problem", id)
+            print("problem", doc_id)
 
 
     combined_tensor_dict = {}
-    for id in tensor_dicts.keys():
+    for doc_id in tensor_dicts.keys():
         all_indices = []
         all_values = []
 
-        for sparse_matrix in tensor_dicts[id]:
+        for sparse_matrix in tensor_dicts[doc_id]:
             # Extract indices and values
             indices = sparse_matrix._indices().clone()
             values = sparse_matrix._values()
@@ -401,7 +397,7 @@ def generate_adj_data_from_grounded_concepts_umls_retrieval__use_glove(grounded_
         # Combine batches
         final_indices = torch.cat(all_indices, dim=1) if all_indices else torch.tensor([], dtype=torch.long)
         final_values = torch.cat(all_values, 0) if all_values else torch.tensor([], dtype=torch.float32)
-        combined_tensor_dict[id] = torch.sparse_coo_tensor(final_indices, final_values, torch.Size(shape))
+        combined_tensor_dict[doc_id] = torch.sparse_coo_tensor(final_indices, final_values, torch.Size(shape))
 
             
     # Save results 183 418 

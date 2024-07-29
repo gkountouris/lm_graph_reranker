@@ -6,7 +6,7 @@ import time
 import json
 
 from modeling import modeling_drums
-from utils import data_utils_retriever
+from utils import data_utils_drums
 from utils import optimization_utils
 from utils import parser_utils
 from utils import utils
@@ -25,6 +25,8 @@ try:
 except:
     from transformers import get_constant_schedule, get_constant_schedule_with_warmup,  get_linear_schedule_with_warmup
 
+import faiss
+import h5py
 import numpy as np
 
 import socket, os, sys, subprocess
@@ -108,60 +110,6 @@ def get_devices(args):
           (args.local_rank, devices[0], bool(args.local_rank != -1), args.world_size), file=sys.stderr)
 
     return devices
-
-
-def tf_loader(args, devices):
-
-    device_to_use = [int(i) for i in os.getenv('DEVICE_TO_USE', '').split(',')]
-    # Assuming args.device_to_use is a list of device indices like [0, 1, 2]
-    num_devices = len(device_to_use)
-
-    # Load Tf_Idf matrix
-    tf_idf_matrix = load_npz(args.tf_idf_path[0])
-
-    tf_idf_matrix = tf_idf_matrix.tocsr()
-
-    # Split the matrix into parts equal to the number of devices
-    split_indices = np.linspace(0, tf_idf_matrix.shape[0], (num_devices*3 + 1), dtype=int)
-    
-    torch_tf_idf_parts = []
-    num_parts = len(split_indices) - 1  # Total number of parts to be distributed
-
-    # Check if the number of parts is as expected
-    if num_parts != 9:
-        raise ValueError("Expected 6 parts, got {}".format(num_parts))
-
-    # Iterate over the number of parts
-    for idx in range(num_parts):
-        start, end = split_indices[idx], split_indices[idx + 1]
-        part = tf_idf_matrix[start:end, :].tocoo()
-
-        # Adjust row indices to reflect original position
-        adjusted_row_indices = part.row + start
-
-        # Create PyTorch sparse tensor with adjusted indices
-        i = torch.LongTensor(np.vstack((adjusted_row_indices, part.col)))
-        v = torch.FloatTensor(part.data)
-        shape = (tf_idf_matrix.shape[0], part.shape[1])  # Keep original number of rows
-
-        # Determine which device to use based on the index
-        if idx < 7:
-            # First six parts go to the last device
-            target_device = devices[-1]
-        # elif idx < 7:
-        #     # Next 1 parts go to the second device
-        #     target_device = devices[-2]
-        else:
-            # Last two parts goes to the first device (cuda:0)
-            target_device = devices[0]
-
-        torch_part = torch.sparse.FloatTensor(i, v, torch.Size(shape)).to(target_device)
-        torch_tf_idf_parts.append(torch_part)
-
-        
-    del tf_idf_matrix 
-
-    return torch_tf_idf_parts
 
 
 def load_data(args, devices, kg):
@@ -323,7 +271,7 @@ def calc_loss_and_acc(logits, labels, loss_type, loss_func, top_scores):
     return loss, n_corrects
 
 
-def calc_eval_accuracy(args, eval_set, model, loss_type, loss_func, debug, save_test_preds, preds_path, tf_idf_matrix):
+def calc_eval_accuracy(args, eval_set, model, loss_type, loss_func, debug, save_test_preds, preds_path):
     """Eval on the dev or test set - calculate loss and accuracy"""
     total_loss_acm = end_loss_acm = mlm_loss_acm = retrieval_loss_acm = 0.0
     link_loss_acm = pos_link_loss_acm = neg_link_loss_acm = 0.0
@@ -336,7 +284,7 @@ def calc_eval_accuracy(args, eval_set, model, loss_type, loss_func, debug, save_
     with torch.no_grad():
         for qids, labels, *input_data in tqdm(eval_set, desc="Dev/Test batch"):
             bs = labels.size(0)
-            logits, retrieval_loss, top_scores, mlm_loss, link_losses = model(*input_data, labels=labels, tf_idf_matrix=tf_idf_matrix)
+            logits, retrieval_loss, top_scores, mlm_loss, link_losses = model(*input_data, labels=labels)
             end_loss, n_corrects = calc_loss_and_acc(logits, labels, loss_type, loss_func, top_scores)
             link_loss, pos_link_loss, neg_link_loss = link_losses
             loss = args.end_task * end_loss + args.retrieval_task * retrieval_loss + args.mlm_task * mlm_loss + args.link_task * link_loss
@@ -365,80 +313,6 @@ def calc_eval_accuracy(args, eval_set, model, loss_type, loss_func, debug, save_
     return total_loss_avg, end_loss_avg, retrieval_loss_avg, mlm_loss_avg, link_loss_avg, pos_link_loss_avg, neg_link_loss_avg, n_corrects_avg
 
 
-def evaluate(args, has_test_split, devices, kg):
-    assert args.load_model_path is not None
-    load_model_path = args.load_model_path
-    print("loading from checkpoint: {}".format(load_model_path))
-    checkpoint = torch.load(load_model_path, map_location='cpu')
-
-    train_statements = args.train_statements
-    dev_statements = args.dev_statements
-    test_statements = args.test_statements
-    train_adj = args.train_adj
-    dev_adj = args.dev_adj
-    test_adj = args.test_adj
-    debug = args.debug
-    inhouse = args.inhouse
-
-    # args = utils.import_config(checkpoint["config"], args)
-    args.train_statements = train_statements
-    args.dev_statements = dev_statements
-    args.test_statements = test_statements
-    args.train_adj = train_adj
-    args.dev_adj = dev_adj
-    args.test_adj = test_adj
-    args.inhouse = inhouse
-
-    dataset = load_data(args, devices, kg)
-    dev_dataloader = dataset.dev()
-    if has_test_split:
-        test_dataloader = dataset.test()
-    model = construct_model(args, kg, dataset)
-    INHERIT_BERT = os.environ.get('INHERIT_BERT', 0)
-    bert_or_roberta = model.lmgnn.bert if INHERIT_BERT else model.lmgnn.roberta
-    bert_or_roberta.resize_token_embeddings(len(dataset.tokenizer))
-
-    model.load_state_dict(checkpoint["model"], strict=False)
-    epoch_id = checkpoint.get('epoch', 0)
-
-    model.to(devices[1])
-    model.lmgnn.concept_emb.to(devices[0])
-    model.eval()
-
-    if args.loss == 'margin_rank':
-        loss_func = nn.MarginRankingLoss(margin=0.1, reduction='mean')
-    elif args.loss == 'cross_entropy':
-        loss_func = nn.CrossEntropyLoss(reduction='mean')
-    elif args.loss == 'custom_rank_loss':
-        loss_func = optimization_utils.CustomRankLoss(max_rank=1000)
-    else:
-        raise ValueError("Invalid value for args.loss.")
-
-    print ('inhouse?', args.inhouse)
-
-    print ('args.train_statements', args.train_statements)
-    print ('args.dev_statements', args.dev_statements)
-    print ('args.test_statements', args.test_statements)
-    print ('args.train_adj', args.train_adj)
-    print ('args.dev_adj', args.dev_adj)
-    print ('args.test_adj', args.test_adj)
-
-    model.eval()
-    # Evaluation on the dev set
-    preds_path = os.path.join(args.save_dir, 'dev_e{}_preds.csv'.format(epoch_id))
-    dev_total_loss, dev_end_loss, dev_retrieval_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc  = calc_eval_accuracy(args, dev_dataloader, model, args.loss, loss_func, debug, not debug, preds_path, tf_idf_matrix)
-    if has_test_split:
-        # Evaluation on the test set
-        preds_path = os.path.join(args.save_dir, 'test_e{}_preds.csv'.format(epoch_id))
-        test_total_loss, test_end_loss, test_retrieval_loss, test_mlm_loss, test_link_loss, test_pos_link_loss, test_neg_link_loss, test_acc = calc_eval_accuracy(args, test_dataloader, model, args.loss, loss_func, debug, not debug, preds_path, tf_idf_matrix)
-    else:
-        test_acc = 0
-
-    print('-' * 71)
-    print('dev_acc {:7.4f}, test_acc {:7.4f}'.format(dev_acc, test_acc))
-    print('-' * 71)
-
-
 def train(args, resume, has_test_split, devices, kg):
 
     if resume:
@@ -460,7 +334,7 @@ def train(args, resume, has_test_split, devices, kg):
     model_path = os.path.join(args.save_dir, 'model.pt')
 
     dataset = load_data(args, devices, kg)
-    tf_idf_matrix = tf_loader(args, devices)
+    
     dev_dataloader = dataset.dev()
     if has_test_split:
         test_dataloader = dataset.test()
@@ -737,6 +611,244 @@ def train(args, resume, has_test_split, devices, kg):
         print(f"Memory used: {memory_freed / (1024 ** 2):.2f} MB", file=sys.stderr)
 
 
+def evaluate(args, has_test_split, devices, kg):
+    assert args.load_model_path is not None
+    load_model_path = args.load_model_path
+    print("loading from checkpoint: {}".format(load_model_path))
+    checkpoint = torch.load(load_model_path, map_location='cpu')
+
+    train_statements = args.train_statements
+    dev_statements = args.dev_statements
+    test_statements = args.test_statements
+    train_adj = args.train_adj
+    dev_adj = args.dev_adj
+    test_adj = args.test_adj
+    debug = args.debug
+    inhouse = args.inhouse
+
+    # args = utils.import_config(checkpoint["config"], args)
+    args.train_statements = train_statements
+    args.dev_statements = dev_statements
+    args.test_statements = test_statements
+    args.train_adj = train_adj
+    args.dev_adj = dev_adj
+    args.test_adj = test_adj
+    args.inhouse = inhouse
+
+    dataset = load_data(args, devices, kg)
+    dev_dataloader = dataset.dev()
+    if has_test_split:
+        test_dataloader = dataset.test()
+    model = construct_model(args, kg, dataset)
+    INHERIT_BERT = os.environ.get('INHERIT_BERT', 0)
+    bert_or_roberta = model.lmgnn.bert if INHERIT_BERT else model.lmgnn.roberta
+    bert_or_roberta.resize_token_embeddings(len(dataset.tokenizer))
+
+    model.load_state_dict(checkpoint["model"], strict=False)
+    epoch_id = checkpoint.get('epoch', 0)
+
+    model.to(devices[1])
+    model.lmgnn.concept_emb.to(devices[0])
+    model.eval()
+
+    if args.loss == 'margin_rank':
+        loss_func = nn.MarginRankingLoss(margin=0.1, reduction='mean')
+    elif args.loss == 'cross_entropy':
+        loss_func = nn.CrossEntropyLoss(reduction='mean')
+    else:
+        raise ValueError("Invalid value for args.loss.")
+
+    print ('inhouse?', args.inhouse)
+
+    print ('args.train_statements', args.train_statements)
+    print ('args.dev_statements', args.dev_statements)
+    print ('args.test_statements', args.test_statements)
+    print ('args.train_adj', args.train_adj)
+    print ('args.dev_adj', args.dev_adj)
+    print ('args.test_adj', args.test_adj)
+
+    model.eval()
+    # Evaluation on the dev set
+    preds_path = os.path.join(args.save_dir, 'dev_e{}_preds.csv'.format(epoch_id))
+    dev_total_loss, dev_end_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc  = calc_eval_accuracy(args, dev_dataloader, model, args.loss, loss_func, debug, not debug, preds_path)
+    if has_test_split:
+        # Evaluation on the test set
+        preds_path = os.path.join(args.save_dir, 'test_e{}_preds.csv'.format(epoch_id))
+        test_total_loss, test_end_loss, test_mlm_loss, test_link_loss, test_pos_link_loss, test_neg_link_loss, test_acc = calc_eval_accuracy(args, test_dataloader, model, args.loss, loss_func, debug, not debug, preds_path)
+    else:
+        test_acc = 0
+
+    print('-' * 71)
+    print('dev_acc {:7.4f}, test_acc {:7.4f}'.format(dev_acc, test_acc))
+    print('-' * 71)
+
+
+def data_for_embeddings(args, devices, kg):
+    _seed = args.seed
+    if args.local_rank != -1:
+        _seed = args.seed + (2** args.local_rank -1) #use different seed for different gpu process so that they have different training examples
+    print ('_seed', _seed, file=sys.stderr)
+    random.seed(_seed)
+    np.random.seed(_seed)
+    torch.manual_seed(_seed)
+    if torch.cuda.is_available() and args.cuda:
+        torch.cuda.manual_seed(_seed)
+
+    #########################################################
+    # Construct the dataset
+    #########################################################
+    one_process_at_a_time = args.data_loader_one_process_at_a_time
+
+    print(args.train_statements, file=sys.stderr)
+
+    if args.local_rank != -1 and one_process_at_a_time:
+        for p_rank in range(args.world_size):
+            if args.local_rank != p_rank: # Barrier
+                torch.distributed.barrier()
+            dataset = data_utils_drums.DRUMS_embeddings_DataLoader(args, args.train_statements, args.train_adj,
+                args.dev_statements, args.dev_adj,
+                args.test_statements, args.test_adj,
+                batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+                devices=devices,
+                model_name=args.encoder,
+                max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
+                is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
+                subsample=args.subsample, n_train=args.n_train, debug=args.debug, cxt_node_connects_all=args.cxt_node_connects_all, kg=kg)
+            if args.local_rank == p_rank: #End of barrier
+                torch.distributed.barrier()
+    else:
+        dataset = data_utils_drums.DRUMS_embeddings_DataLoader(args, args.train_statements, args.train_adj,
+            args.dev_statements, args.dev_adj,
+            args.test_statements, args.test_adj,
+            batch_size=args.batch_size, eval_batch_size=args.eval_batch_size,
+            devices=devices,
+            model_name=args.encoder,
+            max_node_num=args.max_node_num, max_seq_length=args.max_seq_len,
+            is_inhouse=args.inhouse, inhouse_train_qids_path=args.inhouse_train_qids,
+            subsample=args.subsample, n_train=args.n_train, debug=args.debug, cxt_node_connects_all=args.cxt_node_connects_all, kg=kg)
+    return dataset
+
+
+def embeddings(args, devices, kg):
+    assert args.load_model_path is not None
+    load_model_path = args.load_model_path
+    print("loading from checkpoint: {}".format(load_model_path))
+    checkpoint = torch.load(load_model_path, map_location='cpu')
+
+    # index_path = 
+
+    # dimension = 1024  # Adjust based on your embeddings
+    # index = faiss.IndexFlatL2(dimension)
+
+    # Path to your HDF5 file
+    hdf5_path = f'{args.data_dir}/{args.dataset}/hdf5/pubmed_embeddings.hdf5'
+    total_documents = 23662580  # Total number of documents
+    embedding_dim = 1024  # Embedding dimension
+
+    # Initialize HDF5 file and datasets with preallocated space
+    with h5py.File(hdf5_path, 'r+') as f:
+        # embeddings_ds = f.create_dataset('embeddings', (total_documents, embedding_dim), dtype='f2')
+        # ids_ds = f.create_dataset('ids', (total_documents,), dtype='i8')
+        embeddings_ds = f['embeddings']  # Access the 'embeddings' dataset
+        ids_ds = f['ids']                # Access the 'ids' dataset
+
+        # current_idx = 0  # Keep track of where to write in the dataset
+        current_idx = 18400000
+
+        # for i in tqdm(range(0, 237)): 131 184
+        for i in tqdm(range(184, 237)):
+
+            temp_train_statements = args.train_statements
+            temp_dev_statements = args.dev_statements
+            temp_test_statements = args.test_statements
+            temp_train_adj = args.train_adj
+            temp_dev_adj = args.dev_adj
+            temp_test_adj = args.test_adj
+
+            train_statements = args.train_statements + f'pubmed_eval_embeddings_{i:04d}.jsonl'
+            dev_statements = args.dev_statements + f'pubmed_eval_embeddings_{i:04d}.jsonl'
+            test_statements = args.test_statements + f'pubmed_eval_embeddings_{i:04d}.jsonl'
+            train_adj = args.train_adj + f'pubmed_eval_embeddings_{i:04d}.graph.adj.pk'
+            dev_adj = args.dev_adj + f'pubmed_eval_embeddings_{i:04d}.graph.adj.pk'
+            test_adj = args.test_adj + f'pubmed_eval_embeddings_{i:04d}.graph.adj.pk'
+
+            debug = args.debug
+            inhouse = args.inhouse
+
+            # args = utils.import_config(checkpoint["config"], args)
+            args.train_statements = train_statements
+            args.dev_statements = dev_statements
+            args.test_statements = test_statements
+            args.train_adj = train_adj
+            args.dev_adj = dev_adj
+            args.test_adj = test_adj
+            args.inhouse = inhouse
+
+            DATASET_NO_TEST = []
+
+            data_splits = ('train', 'dev') if args.dataset in DATASET_NO_TEST else ('train', 'dev', 'test')
+            for split in data_splits:
+                for attribute in ('statements',):
+                    attr_name = f'{split}_{attribute}'
+                    parser.set_defaults(**{attr_name: getattr(args, attr_name).format(dataset=args.dataset, data_dir=args.data_dir)})
+            if 'test' not in data_splits:
+                parser.set_defaults(test_statements=None)
+
+            dataset = data_for_embeddings(args, devices, kg)
+            dev_dataloader = dataset.dev()
+
+            model = construct_model(args, kg, dataset)
+            INHERIT_BERT = os.environ.get('INHERIT_BERT', 0)
+            bert_or_roberta = model.lmgnn.bert if INHERIT_BERT else model.lmgnn.roberta
+            bert_or_roberta.resize_token_embeddings(len(dataset.tokenizer))
+
+            model.load_state_dict(checkpoint["model"], strict=False)
+            epoch_id = checkpoint.get('epoch', 0)
+
+            model.to(devices[1])
+            model.lmgnn.concept_emb.to(devices[0])
+
+            """On set - calculate embeddings"""
+            model.eval()
+
+            temp_embeddings = []
+            temp_ids = []
+            with torch.no_grad():
+                for qids, labels, *input_data in tqdm(dev_dataloader, desc=args.dev_statements):
+                    logits, cls_embs, mlm_loss, link_losses = model(*input_data)
+                    embs_np = cls_embs.to(torch.float16).cpu().detach().numpy()
+                    labels_np = labels.cpu().numpy()  # Assuming labels are already on CPU and torch tensors
+                    
+                    temp_embeddings.append(embs_np)
+                    temp_ids.append(labels_np)
+
+            # Concatenate temporary arrays
+            temp_embeddings = np.concatenate(temp_embeddings, axis=0)
+            temp_ids = np.concatenate(temp_ids, axis=0)
+
+            # Calculate the indices for where to place the data
+            end_idx = current_idx + temp_embeddings.shape[0]
+            
+            # Directly place the data into the preallocated space
+            embeddings_ds[current_idx:end_idx, :] = temp_embeddings
+            ids_ds[current_idx:end_idx] = temp_ids
+            
+            # Update current_idx for the next iteration
+            current_idx = end_idx
+
+            args.train_statements = temp_train_statements
+            args.dev_statements = temp_dev_statements
+            args.test_statements = temp_test_statements
+            args.train_adj = temp_train_adj
+            args.dev_adj = temp_dev_adj
+            args.test_adj = temp_test_adj
+
+            # # Final index save after all batches
+            # faiss.write_index(index, index_path)
+
+    print("All embeddings and IDs have been saved to HDF5.", file=sys.stderr)
+
+
 def main(args):
     logging.basicConfig(format='%(asctime)s,%(msecs)d %(levelname)-8s [%(name)s:%(funcName)s():%(lineno)d] %(message)s',
                         datefmt='%m/%d/%Y %H:%M:%S',
@@ -744,9 +856,6 @@ def main(args):
     
     has_test_split = True
     devices = get_devices(args)
-
-    for device in devices:
-        print_memory_info(device)
 
     if not args.use_wandb:
         wandb_mode = "disabled"
@@ -774,12 +883,14 @@ def main(args):
 
     if args.mode == 'train':
         train(args, resume, has_test_split, devices, kg)
-    elif args.mode == "eval" :
+    elif "eval" in args.mode:
         assert args.world_size == 1, "DDP is only implemented for training"
         evaluate(args, has_test_split, devices, kg)
+    elif "embeddings" in args.mode:
+        assert args.world_size == 1, "DDP is only implemented for training"
+        embeddings(args, devices, kg)
     else:
         raise ValueError('Invalid mode')
-
 
 if __name__ == '__main__':
     __spec__ = None
@@ -807,7 +918,7 @@ if __name__ == '__main__':
 
     #Task
     parser.add_argument('--end_task', type=float, default=0.0, help='Task weight for the end task')
-    parser.add_argument('--retrieval_task', type=float, default=1.0, help='Document retrieval task')
+    parser.add_argument('--retrieval_task', type=float, default=0.0, help='Document retrieval task')
     parser.add_argument('--mlm_task', type=float, default=0.0, help='Task weight for the MLM task')
     parser.add_argument('--link_task', type=float, default=0.0, help='Task weight for the LinkPred task')
 
@@ -830,9 +941,15 @@ if __name__ == '__main__':
     parser.add_argument('--kg', default='umls', help="What KG to use.")
     parser.add_argument('--max_num_relation', default=-1, type=int, help="max number of KG relation types to keep.")
 
-    parser.add_argument('--train_adj', default=f'{args.data_dir}/{args.dataset}/graph/train_mini.graph.adj.pk', help="The path to the retrieved KG subgraphs of the training set.")
-    parser.add_argument('--dev_adj', default=f'{args.data_dir}/{args.dataset}/graph/dev_mini.graph.adj.pk', help="The path to the retrieved KG subgraphs of the dev set.")
-    parser.add_argument('--test_adj', default=f'{args.data_dir}/{args.dataset}/graph/test_mini.graph.adj.pk', help="The path to the retrieved KG subgraphs of the test set.")
+    # statements
+    parser.add_argument('--train_statements', default=f'{args.data_dir}/{args.dataset}/statement/')
+    parser.add_argument('--dev_statements', default=f'{args.data_dir}/{args.dataset}/statement/')
+    parser.add_argument('--test_statements', default=f'{args.data_dir}/{args.dataset}/statement/')
+
+    parser.add_argument('--train_adj', default=f'{args.data_dir}/{args.dataset}/graph/', help="The path to the retrieved KG subgraphs of the training set.")
+    parser.add_argument('--dev_adj', default=f'{args.data_dir}/{args.dataset}/graph/', help="The path to the retrieved KG subgraphs of the dev set.")
+    parser.add_argument('--test_adj', default=f'{args.data_dir}/{args.dataset}/graph/', help="The path to the retrieved KG subgraphs of the test set.")
+
     parser.add_argument('--max_node_num', default=5000, type=int, help="Max number of nodes / the threshold used to prune nodes.")
     parser.add_argument('--subsample', default=1.0, type=float, help="The ratio to subsample the training set.")
     parser.add_argument('--n_train', default=-1, type=int, help="Number of training examples to use. Setting it to -1 means using the `subsample` argument to determine the training set size instead; otherwise it will override the `subsample` argument.")
@@ -861,11 +978,11 @@ if __name__ == '__main__':
     # Optimization
     parser.add_argument('-dlr', '--decoder_lr', default=1e-3, type=float, help='Learning rate of parameters not in LM')
     parser.add_argument('-mbs', '--mini_batch_size', default=1, type=int)
-    parser.add_argument('-ebs', '--eval_batch_size', default=2, type=int)
+    parser.add_argument('-ebs', '--eval_batch_size', default=100, type=int)
     parser.add_argument('--unfreeze_epoch', default=4, type=int, help="Number of the first few epochs in which LM's parameters are kept frozen.")
     parser.add_argument('--refreeze_epoch', default=10000, type=int)
     parser.add_argument('--init_range', default=0.02, type=float, help='stddev when initializing with normal distribution')
-    parser.add_argument('--fp16', default=False, type=utils.bool_flag, help='use fp16 training. this requires torch>=1.6.0')
+    parser.add_argument('--fp16', default=True, type=utils.bool_flag, help='use fp16 training. this requires torch>=1.6.0')
     parser.add_argument('--upcast', default=False, type=utils.bool_flag, help='Upcast attention computation during fp16 training')
     parser.add_argument('--redef_epoch_steps', default=-1, type=int)
     parser.add_argument('--max_rank', default=1000, type=int, help="How many documents should the model return")

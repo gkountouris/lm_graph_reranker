@@ -7,7 +7,25 @@
 /embeddings
 /tests
 /thesis
+It_must_be_done.py
+dragon.py
+test.py
+test2.py
+test3.py
+test4.py
+test5.py
+test6.py
+tf_mini_matrices_creator.py
+weight_similarities.py
+json.train
 
+*hdf5
 *xml
 *json
 *jsonl
+*log
+*txt
+*gz
+*.pt
+
+

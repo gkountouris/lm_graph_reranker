@@ -137,17 +137,31 @@ class RAdam(Optimizer):
                         step_size = -1
                     buffered[2] = step_size
 
-                # more conservative since it's an approximated value
+                # # more conservative since it's an approximated value
+                # if N_sma >= 5:
+                #     if group['weight_decay'] != 0:
+                #         p_data_fp32.add_(-group['weight_decay'] * group['lr'], p_data_fp32)
+                #     denom = exp_avg_sq.sqrt().add_(group['eps'])
+                #     p_data_fp32.addcdiv_(-step_size * group['lr'], exp_avg, denom)
+                #     p.data.copy_(p_data_fp32)
+                # elif step_size > 0:
+                #     if group['weight_decay'] != 0:
+                #         p_data_fp32.add_(-group['weight_decay'] * group['lr'], p_data_fp32)
+                #     p_data_fp32.add_(-step_size * group['lr'], exp_avg)
+                #     p.data.copy_(p_data_fp32)
+
                 if N_sma >= 5:
                     if group['weight_decay'] != 0:
-                        p_data_fp32.add_(-group['weight_decay'] * group['lr'], p_data_fp32)
+                        # Corrected weight decay application
+                        p_data_fp32.mul_(1 - group['lr'] * group['weight_decay'])
                     denom = exp_avg_sq.sqrt().add_(group['eps'])
-                    p_data_fp32.addcdiv_(-step_size * group['lr'], exp_avg, denom)
+                    p_data_fp32.addcdiv_(exp_avg, denom, value=-step_size * group['lr'])
                     p.data.copy_(p_data_fp32)
                 elif step_size > 0:
                     if group['weight_decay'] != 0:
-                        p_data_fp32.add_(-group['weight_decay'] * group['lr'], p_data_fp32)
-                    p_data_fp32.add_(-step_size * group['lr'], exp_avg)
+                        # Corrected weight decay application
+                        p_data_fp32.mul_(1 - group['lr'] * group['weight_decay'])
+                    p_data_fp32.add_(exp_avg, alpha=-step_size * group['lr'])
                     p.data.copy_(p_data_fp32)
 
         return loss

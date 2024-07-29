@@ -20,7 +20,6 @@ def load_umls_vocab(vocab_path):
         vocab = [l.strip() for l in fin]
     return vocab
 
-
 def load_entity_linker(threshold=0.90):
     nlp = spacy.load("en_core_sci_sm")
     linker = EntityLinker(
@@ -31,7 +30,6 @@ def load_entity_linker(threshold=0.90):
     return nlp, linker
 
 def entity_linking_to_umls(sentence, nlp, linker):
-
     doc = nlp(sentence)
     entities = doc.ents
     all_entities_results = []
@@ -54,7 +52,6 @@ def entity_linking_to_umls(sentence, nlp, linker):
                                 "start_char": entities[mm].start_char, "end_char": entities[mm].end_char,
                                 "linking_results": all_entity_results}
         all_entities_results.append(curr_entities_result)
-        
     return all_entities_results
 
 def ground_mentioned_concepts(nlp, linker, sent):

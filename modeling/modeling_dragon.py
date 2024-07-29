@@ -308,7 +308,6 @@ class LMGNN(PreTrainedModelClass):
         node_mask = node_mask | (node_type_ids == 3) # pool over all KG nodes (excluding the context node)
         node_mask[node_mask.all(1), 0] = 0  # a temporary solution to avoid zero node
 
-
         # sent_node_mask = special_nodes_mask.clone()
         # sent_node_mask[:, 0] = 0
 

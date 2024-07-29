@@ -32,40 +32,6 @@ import socket, os, sys, subprocess
 logger = logging.getLogger(__name__)
 
 
-def tensor_memory_size(tensor):
-    """
-    Calculate the memory size occupied by a tensor.
-    """
-    # Get number of elements in tensor
-    num_elements = tensor.numel()
-    
-    # Get size of each element in bytes
-    element_size = tensor.element_size()
-    
-    # Total memory in bytes
-    total_bytes = num_elements * element_size
-    
-    # Convert bytes to kilobytes (1 KB = 1024 Bytes)
-    total_kilobytes = total_bytes / 1024
-    
-    # Convert kilobytes to megabytes (1 MB = 1024 KB)
-    total_megabytes = total_kilobytes / 1024
-
-    total_gigabytes = total_megabytes / 1024
-    
-    return total_gigabytes
-
-
-def print_memory_info(device):
-    if "cuda" in device.type:
-        total_memory = torch.cuda.get_device_properties(device).total_memory
-        allocated_memory = torch.cuda.memory_allocated(device)
-        free_memory = total_memory - allocated_memory
-        print(f"Device: {device}, Total memory: {total_memory}, Allocated memory: {allocated_memory}, Free memory: {free_memory}", file=sys.stderr)
-    else:
-        print(f"Device: {device}, Memory info not available for CPU", file=sys.stderr)
-
-
 def get_devices(args):
     devices = []  # List to hold the selected devices
 
@@ -110,60 +76,6 @@ def get_devices(args):
     return devices
 
 
-def tf_loader(args, devices):
-
-    device_to_use = [int(i) for i in os.getenv('DEVICE_TO_USE', '').split(',')]
-    # Assuming args.device_to_use is a list of device indices like [0, 1, 2]
-    num_devices = len(device_to_use)
-
-    # Load Tf_Idf matrix
-    tf_idf_matrix = load_npz(args.tf_idf_path[0])
-
-    tf_idf_matrix = tf_idf_matrix.tocsr()
-
-    # Split the matrix into parts equal to the number of devices
-    split_indices = np.linspace(0, tf_idf_matrix.shape[0], (num_devices*3 + 1), dtype=int)
-    
-    torch_tf_idf_parts = []
-    num_parts = len(split_indices) - 1  # Total number of parts to be distributed
-
-    # Check if the number of parts is as expected
-    if num_parts != 9:
-        raise ValueError("Expected 6 parts, got {}".format(num_parts))
-
-    # Iterate over the number of parts
-    for idx in range(num_parts):
-        start, end = split_indices[idx], split_indices[idx + 1]
-        part = tf_idf_matrix[start:end, :].tocoo()
-
-        # Adjust row indices to reflect original position
-        adjusted_row_indices = part.row + start
-
-        # Create PyTorch sparse tensor with adjusted indices
-        i = torch.LongTensor(np.vstack((adjusted_row_indices, part.col)))
-        v = torch.FloatTensor(part.data)
-        shape = (tf_idf_matrix.shape[0], part.shape[1])  # Keep original number of rows
-
-        # Determine which device to use based on the index
-        if idx < 7:
-            # First six parts go to the last device
-            target_device = devices[-1]
-        # elif idx < 7:
-        #     # Next 1 parts go to the second device
-        #     target_device = devices[-2]
-        else:
-            # Last two parts goes to the first device (cuda:0)
-            target_device = devices[0]
-
-        torch_part = torch.sparse.FloatTensor(i, v, torch.Size(shape)).to(target_device)
-        torch_tf_idf_parts.append(torch_part)
-
-        
-    del tf_idf_matrix 
-
-    return torch_tf_idf_parts
-
-
 def load_data(args, devices, kg):
     _seed = args.seed
     if args.local_rank != -1:
@@ -179,8 +91,6 @@ def load_data(args, devices, kg):
     # Construct the dataset
     #########################################################
     one_process_at_a_time = args.data_loader_one_process_at_a_time
-
-    print(args.train_statements, file=sys.stderr)
 
     if args.local_rank != -1 and one_process_at_a_time:
         for p_rank in range(args.world_size):
@@ -221,7 +131,7 @@ def construct_model(args, kg, dataset):
     cp_emb = torch.tensor(cp_emb, dtype=torch.float)
 
     # Calculate memory size
-    memory_size = tensor_memory_size(cp_emb)
+    memory_size = utils.tensor_memory_size(cp_emb)
 
     print(f"Memory size of concatenated tensor: {memory_size:.2f} MB", file=sys.stderr)
 
@@ -239,15 +149,7 @@ def construct_model(args, kg, dataset):
     #   Build model
     ##########################################################
 
-    if kg == "cpnet":
-        n_ntype = 4
-        n_etype = 38
-        # assert n_etype == dataset.final_num_relation *2
-    elif kg == "ddb":
-        n_ntype = 4
-        n_etype = 34
-        # assert n_etype == dataset.final_num_relation *2
-    elif kg == "umls":
+    if kg == "umls":
         n_ntype = 4
         n_etype = dataset.final_num_relation *2
         print ('final_num_relation', dataset.final_num_relation, 'len(id2relation)', len(dataset.id2relation))
@@ -288,17 +190,7 @@ def sep_params(model, loaded_roberta_keys):
     return loaded_params, not_loaded_params, params_to_freeze, small_lr_params, large_lr_params
 
 
-def count_parameters(loaded_params, not_loaded_params):
-    num_params = sum(p.numel() for p in not_loaded_params.values() if p.requires_grad)
-    num_fixed_params = sum(p.numel() for p in not_loaded_params.values() if not p.requires_grad)
-    num_loaded_params = sum(p.numel() for p in loaded_params.values())
-    print('num_trainable_params (out of not_loaded_params):', num_params, file=sys.stderr)
-    print('num_fixed_params (out of not_loaded_params):', num_fixed_params, file=sys.stderr)
-    print('num_loaded_params:', num_loaded_params, file=sys.stderr)
-    print('num_total_params:', num_params + num_fixed_params + num_loaded_params, file=sys.stderr)
-
-
-def calc_loss_and_acc(logits, labels, loss_type, loss_func, top_scores):
+def calc_loss_and_acc(logits, labels, loss_type, loss_func):
     if logits is None:
         loss = 0.
         n_corrects = 0
@@ -311,15 +203,6 @@ def calc_loss_and_acc(logits, labels, loss_type, loss_func, top_scores):
         loss *= bs
         n_corrects = (logits.argmax(1) == labels).sum().item()
 
-    # Handling top_scores
-    if top_scores is not None:
-        top_score_corrects = 0
-        for score, label in zip(top_scores, labels):
-            top_score_idx = score.argmax().item()  # Index of the top score in the tensor
-            if top_score_idx == label.item():  # Check if this index matches the label
-                top_score_corrects += 1
-        n_corrects += top_score_corrects
-
     return loss, n_corrects
 
 
@@ -327,17 +210,17 @@ def calc_eval_accuracy(args, eval_set, model, loss_type, loss_func, debug, save_
     """Eval on the dev or test set - calculate loss and accuracy"""
     total_loss_acm = end_loss_acm = mlm_loss_acm = retrieval_loss_acm = 0.0
     link_loss_acm = pos_link_loss_acm = neg_link_loss_acm = 0.0
-    n_samples_acm = n_corrects_acm = 0
+    n_samples_acm = n_corrects_acm = n_corrects_docs_acm = 0
     model.eval()
-    save_test_preds = (save_test_preds and args.end_task)
+    # save_test_preds = (save_test_preds and args.end_task)
     if save_test_preds:
         utils.check_path(preds_path)
-        f_preds = open(preds_path, 'w')
+        dense_tensors_dict = {} 
     with torch.no_grad():
         for qids, labels, *input_data in tqdm(eval_set, desc="Dev/Test batch"):
             bs = labels.size(0)
-            logits, top_scores, mlm_loss, link_losses = model(*input_data, labels=labels)
-            end_loss, n_corrects = calc_loss_and_acc(logits, labels, loss_type, loss_func, top_scores)
+            logits, retrieval_loss, num_retrieved, sorted_doc_labels_tensor, mlm_loss, link_losses = model(*input_data, labels=labels)
+            end_loss, n_corrects = calc_loss_and_acc(logits, labels, loss_type, loss_func)
             link_loss, pos_link_loss, neg_link_loss = link_losses
             loss = args.end_task * end_loss + args.retrieval_task * retrieval_loss + args.mlm_task * mlm_loss + args.link_task * link_loss
 
@@ -349,20 +232,20 @@ def calc_eval_accuracy(args, eval_set, model, loss_type, loss_func, debug, save_
             pos_link_loss_acm += float(pos_link_loss)
             neg_link_loss_acm += float(neg_link_loss)
             n_corrects_acm += n_corrects
+            n_corrects_docs_acm += num_retrieved
             n_samples_acm += bs
 
+            
             if save_test_preds:
-                predictions = logits.argmax(1) #[bsize, ]
-                for qid, pred in zip(qids, predictions):
-                    print ('{},{}'.format(qid, chr(ord('A') + pred.item())), file=f_preds)
-                    f_preds.flush()
+                for qid, pred in zip(qids, sorted_doc_labels_tensor):
+                    dense_tensors_dict[qid] = pred
             if debug:
                 break
     if save_test_preds:
-        f_preds.close()
-    total_loss_avg, end_loss_avg, retrieval_loss_avg, mlm_loss_avg, link_loss_avg, pos_link_loss_avg, neg_link_loss_avg, n_corrects_avg = \
-        [item / n_samples_acm for item in (total_loss_acm, end_loss_acm, retrieval_loss_acm, mlm_loss_acm, link_loss_acm, pos_link_loss_acm, neg_link_loss_acm, n_corrects_acm)]
-    return total_loss_avg, end_loss_avg, retrieval_loss_avg, mlm_loss_avg, link_loss_avg, pos_link_loss_avg, neg_link_loss_avg, n_corrects_avg
+        torch.save(dense_tensors_dict, preds_path)
+    total_loss_avg, end_loss_avg, retrieval_loss_avg, mlm_loss_avg, link_loss_avg, pos_link_loss_avg, neg_link_loss_avg, n_corrects_avg, n_correct_docs_avg = \
+        [item / n_samples_acm for item in (total_loss_acm, end_loss_acm, retrieval_loss_acm, mlm_loss_acm, link_loss_acm, pos_link_loss_acm, neg_link_loss_acm, n_corrects_acm, n_corrects_docs_acm)]
+    return total_loss_avg, end_loss_avg, retrieval_loss_avg, mlm_loss_avg, link_loss_avg, pos_link_loss_avg, neg_link_loss_avg, n_corrects_avg, n_correct_docs_avg
 
 
 def evaluate(args, has_test_split, devices, kg):
@@ -403,6 +286,9 @@ def evaluate(args, has_test_split, devices, kg):
 
     model.to(devices[1])
     model.lmgnn.concept_emb.to(devices[0])
+    model.lmgnn.cls_projection.to(devices[2])
+    model.lmgnn.gnn_projection.to(devices[2])
+    model.lmgnn.documents_projection.to(devices[2])
     model.eval()
 
     if args.loss == 'margin_rank':
@@ -425,12 +311,12 @@ def evaluate(args, has_test_split, devices, kg):
 
     model.eval()
     # Evaluation on the dev set
-    preds_path = os.path.join(args.save_dir, 'dev_e{}_preds.csv'.format(epoch_id))
-    dev_total_loss, dev_end_loss, dev_retrieval_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc  = calc_eval_accuracy(args, dev_dataloader, model, args.loss, loss_func, debug, not debug, preds_path)
+    preds_path = os.path.join(args.save_dir, 'dev_e{}_preds.pt'.format(epoch_id))
+    dev_total_loss, dev_end_loss, dev_retrieval_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc, dev_docs_acc  = calc_eval_accuracy(args, dev_dataloader, model, args.loss, loss_func, debug, not debug, preds_path)
     if has_test_split:
         # Evaluation on the test set
-        preds_path = os.path.join(args.save_dir, 'test_e{}_preds.csv'.format(epoch_id))
-        test_total_loss, test_end_loss, test_retrieval_loss, test_mlm_loss, test_link_loss, test_pos_link_loss, test_neg_link_loss, test_acc = calc_eval_accuracy(args, test_dataloader, model, args.loss, loss_func, debug, not debug, preds_path)
+        preds_path = os.path.join(args.save_dir, 'test_e{}_preds.pt'.format(epoch_id))
+        test_total_loss, test_end_loss, test_retrieval_loss, test_mlm_loss, test_link_loss, test_pos_link_loss, test_neg_link_loss, test_acc, test_docs_acc = calc_eval_accuracy(args, test_dataloader, model, args.loss, loss_func, debug, not debug, preds_path)
     else:
         test_acc = 0
 
@@ -490,7 +376,7 @@ def train(args, resume, has_test_split, devices, kg):
                 print('\t{:45}\tfixed\t{}\tdevice:{}'.format(name, param.size(), param.device))
 
         # Count parameters
-        count_parameters(loaded_params, not_loaded_params)
+        utils.count_parameters(loaded_params, not_loaded_params)
 
     no_decay = ['bias', 'LayerNorm.bias', 'LayerNorm.weight']
 
@@ -535,7 +421,6 @@ def train(args, resume, has_test_split, devices, kg):
            pass
         model.load_state_dict(model_state_dict, strict=False)
 
-
     #########################################################
     # Create a scheduler
     #########################################################
@@ -562,6 +447,9 @@ def train(args, resume, has_test_split, devices, kg):
     model.to(devices[1])
     if hasattr(model.lmgnn, 'concept_emb'):
         model.lmgnn.concept_emb.to(devices[0])
+    model.lmgnn.cls_projection.to(devices[2])
+    model.lmgnn.gnn_projection.to(devices[2])
+    model.lmgnn.documents_projection.to(devices[2])
 
     # Distributed training (should be after apex fp16 initialization)
     if args.local_rank != -1:
@@ -594,7 +482,7 @@ def train(args, resume, has_test_split, devices, kg):
 
     total_loss_acm = end_loss_acm = mlm_loss_acm = retrieval_loss_acm = 0.0
     link_loss_acm = pos_link_loss_acm = neg_link_loss_acm = 0.0
-    n_samples_acm = n_corrects_acm = 0
+    n_samples_acm = n_corrects_acm = n_corrects_docs_acm = 0
     total_time = 0
     model.train()
     # If all the parameters are frozen in the first few epochs, just skip those epochs.
@@ -622,11 +510,11 @@ def train(args, resume, has_test_split, devices, kg):
                 b = min(a + args.mini_batch_size, bs)
                 if args.fp16:
                     with torch.cuda.amp.autocast():
-                        logits, top_scores, mlm_loss, link_losses = model(*[x[a:b] for x in input_data], labels=labels[a:b]) # logits: [bs, nc] and tf_idf_matrix
-                        end_loss, n_corrects = calc_loss_and_acc(logits, labels[a:b], args.loss, loss_func, top_scores)
+                        logits, retrieval_loss, num_retrieved, sorted_doc_labels_tensor, mlm_loss, link_losses = model(*[x[a:b] for x in input_data], labels=labels[a:b]) # logits: [bs, nc] and tf_idf_matrix
+                        end_loss, n_corrects = calc_loss_and_acc(logits, labels[a:b], args.loss, loss_func)
                 else:
-                    logits, top_scores, mlm_loss, link_losses = model(*[x[a:b] for x in input_data], labels=labels[a:b]) # logits: [bs, nc] and tf_idf_matrix
-                    end_loss, n_corrects = calc_loss_and_acc(logits, labels[a:b], args.loss, loss_func, top_scores)
+                    logits, retrieval_loss, num_retrieved, sorted_doc_labels_tensor, mlm_loss, link_losses = model(*[x[a:b] for x in input_data], labels=labels[a:b]) # logits: [bs, nc] and tf_idf_matrix
+                    end_loss, n_corrects = calc_loss_and_acc(logits, labels[a:b], args.loss, loss_func)
                 link_loss, pos_link_loss, neg_link_loss = link_losses
                 loss = args.end_task * end_loss + args.retrieval_task * retrieval_loss + args.mlm_task * mlm_loss + args.link_task * link_loss
 
@@ -677,32 +565,38 @@ def train(args, resume, has_test_split, devices, kg):
 
                 total_loss_acm = end_loss_acm = mlm_loss_acm = retrieval_loss_acm = 0.0
                 link_loss_acm = pos_link_loss_acm = neg_link_loss_acm = 0.0
-                n_samples_acm = n_corrects_acm = 0
+                n_samples_acm = n_corrects_acm = n_corrects_docs_acm= 0
                 total_time = 0
             global_step += 1 # Number of batches processed up to now
+            
 
         print("Batch time", time.time() - start_time, file=sys.stderr)
         # Save checkpoints and evaluate after every epoch
         if args.local_rank in [-1, 0]:
             model.eval()
-            preds_path = os.path.join(args.save_dir, 'dev_e{}_preds.csv'.format(epoch_id))
-            dev_total_loss, dev_end_loss, dev_retrieval_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc = calc_eval_accuracy(args, dev_dataloader, model, args.loss, loss_func, args.debug, not args.debug, preds_path)
-            print ('dev_acc', dev_acc, file=sys.stderr)
+            preds_path = os.path.join(args.save_dir, 'dev_e{}_preds.pt'.format(epoch_id))
+            dev_total_loss, dev_end_loss, dev_retrieval_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc, dev_docs_acc = calc_eval_accuracy(args, dev_dataloader, model, args.loss, loss_func, args.debug, not args.debug, preds_path)
+            print ('dev_docs_acc', dev_docs_acc, file=sys.stderr)
 
-            test_acc = 0
-            test_retrieval_loss = 0
+            if has_test_split:
+                preds_path = os.path.join(args.save_dir, 'test_e{}_preds.pt'.format(epoch_id))
+                test_total_loss, test_end_loss, test_retrieval_loss, test_mlm_loss, test_link_loss, test_pos_link_loss, test_neg_link_loss, test_acc, test_docs_acc = calc_eval_accuracy(args, test_dataloader, model, args.loss, loss_func, args.debug, not args.debug, preds_path)
+                print ('test_docs_acc', test_docs_acc)
+            else:
+                test_docs_acc = 0
+                test_retrieval_loss = 0
 
             print('-' * 71)
-            print('| epoch {:3} | step {:5} | dev_acc {:7.4f} | test_acc {:7.4f} | dev_retrieval_loss {:7.4f} | test_retrieval_loss {:7.4f}'.format(epoch_id, global_step, dev_acc, test_acc, dev_retrieval_loss, test_retrieval_loss))
+            print('| epoch {:3} | step {:5} | dev_docs_acc {:7.4f} | test_docs_acc {:7.4f} | dev_retrieval_loss {:7.4f} | test_retrieval_loss {:7.4f}'.format(epoch_id, global_step, dev_docs_acc, test_docs_acc, dev_retrieval_loss, test_retrieval_loss))
             print('-' * 71)
 
-            # if dev_acc >= best_dev_acc:
-            #     best_dev_acc = dev_acc
-            #     final_test_acc = test_acc
-            #     best_dev_epoch = epoch_id
-            # if not args.debug:
-            #     with open(log_path, 'a') as fout:
-            #         fout.write('{:3},{:5},{:7.4f},{:7.4f},{:7.4f},{:7.4f},{:3}\n'.format(epoch_id, global_step, dev_acc, test_acc, best_dev_acc, final_test_acc, best_dev_epoch))
+            if dev_acc >= best_dev_acc:
+                best_dev_acc = dev_acc
+                final_test_acc = test_acc
+                best_dev_epoch = epoch_id
+            if not args.debug:
+                with open(log_path, 'a') as fout:
+                    fout.write('{:3},{:5},{:7.4f},{:7.4f},{:7.4f},{:7.4f},{:3}\n'.format(epoch_id, global_step, dev_acc, test_acc, best_dev_acc, final_test_acc, best_dev_epoch))
 
             # Save the model checkpoint
             if (args.save_model==2) or ((args.save_model==1) and (best_dev_epoch==epoch_id)):
@@ -719,7 +613,7 @@ def train(args, resume, has_test_split, devices, kg):
                 torch.save(checkpoint, model_path +".{}".format(epoch_id))
 
         model.train()
-        start_time = time.time()
+        
         if epoch_id > args.unfreeze_epoch and epoch_id - best_dev_epoch >= args.max_epochs_before_stop:
             if args.local_rank in [-1, 0]:
                 break
@@ -727,9 +621,9 @@ def train(args, resume, has_test_split, devices, kg):
         if args.debug:
             break
 
-        del logits, top_scores, mlm_loss, link_losses, loss, end_loss, n_corrects
-        del dev_total_loss, dev_end_loss, dev_retrieval_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc
-        gc.collect()
+        # del logits, retrieval_loss, mlm_loss, link_losses, loss, end_loss, n_corrects
+        # del dev_total_loss, dev_end_loss, dev_retrieval_loss, dev_mlm_loss, dev_link_loss, dev_pos_link_loss, dev_neg_link_loss, dev_acc
+        # gc.collect()
 
 
 def main(args):
@@ -741,7 +635,7 @@ def main(args):
     devices = get_devices(args)
 
     for device in devices:
-        print_memory_info(device)
+        utils.print_memory_info(device)
 
     if not args.use_wandb:
         wandb_mode = "disabled"
